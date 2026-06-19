@@ -3,14 +3,22 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/sumedho/dogear/internal/dogear"
 )
+
+const serverTestPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
 func TestAPIEndpoints(t *testing.T) {
 	store := testStore(t)
@@ -71,6 +79,209 @@ func TestAskDryRun(t *testing.T) {
 	}
 	if len(payload.Sources) == 0 {
 		t.Fatal("expected sources")
+	}
+}
+
+func TestContextDebugResponse(t *testing.T) {
+	store := testStore(t)
+	handler := New(Options{Store: store})
+	request := httptest.NewRequest(http.MethodGet, "/api/context?q=local+control&debug=true", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Query  string `json:"query"`
+		Blocks []struct {
+			Source struct {
+				DocumentID string `json:"document_id"`
+				Debug      *struct {
+					Quality string `json:"quality"`
+				} `json:"debug"`
+			} `json:"source"`
+		} `json:"blocks"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Query != "local control" || len(payload.Blocks) == 0 {
+		t.Fatalf("unexpected context response: %#v", payload)
+	}
+	if payload.Blocks[0].Source.DocumentID != "test-synth" || payload.Blocks[0].Source.Debug == nil {
+		t.Fatalf("unexpected source response: %#v", payload.Blocks[0].Source)
+	}
+}
+
+func TestDocumentAndSearchResponseContracts(t *testing.T) {
+	store := testStore(t)
+	handler := New(Options{Store: store})
+
+	documentsRequest := httptest.NewRequest(http.MethodGet, "/api/documents", nil)
+	documentsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(documentsResponse, documentsRequest)
+	var documents []struct {
+		ID         string   `json:"id"`
+		SourcePath string   `json:"source_path"`
+		Tags       []string `json:"tags"`
+	}
+	if err := json.Unmarshal(documentsResponse.Body.Bytes(), &documents); err != nil {
+		t.Fatal(err)
+	}
+	if len(documents) != 1 || documents[0].ID != "test-synth" || documents[0].SourcePath != "test.md" || len(documents[0].Tags) != 1 {
+		t.Fatalf("unexpected documents response: %#v", documents)
+	}
+
+	searchRequest := httptest.NewRequest(http.MethodGet, "/api/search?q=local+control", nil)
+	searchResponse := httptest.NewRecorder()
+	handler.ServeHTTP(searchResponse, searchRequest)
+	var results []struct {
+		DocumentID string          `json:"document_id"`
+		Snippet    string          `json:"snippet"`
+		Debug      json.RawMessage `json:"debug"`
+	}
+	if err := json.Unmarshal(searchResponse.Body.Bytes(), &results); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 || results[0].DocumentID != "test-synth" || results[0].Snippet == "" || results[0].Debug != nil {
+		t.Fatalf("unexpected search response: %#v", results)
+	}
+}
+
+func TestImportAndServeEmbeddedImage(t *testing.T) {
+	store := testStore(t)
+	handler := New(Options{Store: store})
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "images.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := "# Images\n\n## Diagram\n\nThe control diagram explains local control.\n\n![Diagram](data:image/png;base64," + serverTestPNGBase64 + ")\n"
+	if _, err := part.Write([]byte(markdown)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/import", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	retrieval, err := store.Retrieve(context.Background(), dogear.RetrieveOptions{Query: "control diagram", DocumentID: "images", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retrieval.Blocks) != 1 || len(retrieval.Blocks[0].Images) != 1 {
+		t.Fatalf("unexpected retrieval: %#v", retrieval)
+	}
+	imageRequest := httptest.NewRequest(http.MethodGet, "/api/images/"+strconv.FormatInt(retrieval.Blocks[0].Images[0].ID, 10), nil)
+	imageResponse := httptest.NewRecorder()
+	handler.ServeHTTP(imageResponse, imageRequest)
+	want, _ := base64.StdEncoding.DecodeString(serverTestPNGBase64)
+	if imageResponse.Code != http.StatusOK || imageResponse.Header().Get("Content-Type") != "image/png" || !bytes.Equal(imageResponse.Body.Bytes(), want) {
+		t.Fatalf("unexpected image response: status=%d headers=%v", imageResponse.Code, imageResponse.Header())
+	}
+	cachedRequest := httptest.NewRequest(http.MethodGet, imageRequest.URL.Path, nil)
+	cachedRequest.Header.Set("If-None-Match", imageResponse.Header().Get("ETag"))
+	cachedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(cachedResponse, cachedRequest)
+	if cachedResponse.Code != http.StatusNotModified || cachedResponse.Header().Get("ETag") == "" {
+		t.Fatalf("unexpected cached image response: status=%d headers=%v", cachedResponse.Code, cachedResponse.Header())
+	}
+}
+
+func TestAskStreamSSE(t *testing.T) {
+	store := testStore(t)
+	var messageCount int
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Stream   bool  `json:"stream"`
+			Messages []any `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if !request.Stream {
+			t.Fatal("provider request did not enable streaming")
+		}
+		messageCount = len(request.Messages)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Turn it \"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"off [1].\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer provider.Close()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[provider]\nbase_url = \""+provider.URL+"/v1\"\nmodel = \"test-model\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(Options{Store: store, ConfigPath: configPath})
+	body := bytes.NewBufferString(`{"question":"local control","history":[{"role":"user","content":"Earlier"},{"role":"assistant","content":"Earlier answer"}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/ask/stream", body)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	if messageCount != 4 || !strings.Contains(response.Body.String(), "event: delta") || !strings.Contains(response.Body.String(), "event: result") || !strings.Contains(response.Body.String(), "Turn it off [1].") {
+		t.Fatalf("messageCount=%d stream=%s", messageCount, response.Body.String())
+	}
+}
+
+func TestEmbeddedSPA(t *testing.T) {
+	handler := New(Options{Store: testStore(t)})
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `<div id="root"></div>`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestStructuredAccessLogs(t *testing.T) {
+	store, err := dogear.Open(filepath.Join(t.TempDir(), "dogear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	handler := New(Options{Store: store, Logger: logger})
+
+	for _, path := range []string{"/api/health", "/api/search?unused=secret+terms"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		handler.ServeHTTP(httptest.NewRecorder(), request)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/documents", nil))
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("log records = %d, want 3: %s", len(lines), output.String())
+	}
+	wantLevels := []string{"INFO", "WARN", "ERROR"}
+	wantStatuses := []float64{200, 400, 500}
+	for i, line := range lines {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record["msg"] != "http request" || record["level"] != wantLevels[i] || record["status"] != wantStatuses[i] {
+			t.Fatalf("record %d = %#v", i, record)
+		}
+		if strings.Contains(record["path"].(string), "secret") || strings.Contains(line, "secret terms") {
+			t.Fatalf("query leaked into log: %s", line)
+		}
 	}
 }
 

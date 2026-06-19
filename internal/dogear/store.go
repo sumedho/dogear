@@ -14,7 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type Store struct {
 	db   *sql.DB
@@ -114,6 +114,19 @@ type SourceRef struct {
 type ContextBlock struct {
 	Source SourceRef
 	Text   string
+	Images []ImageRef
+}
+
+type ImageRef struct {
+	ID        int64
+	Alt       string
+	MediaType string
+}
+
+type StoredImage struct {
+	ImageRef
+	Data        []byte
+	ContentHash string
 }
 
 type RetrievalResult struct {
@@ -208,7 +221,20 @@ func (s *Store) Init() error {
 		`CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_chunks_page ON chunks(document_id, page_number);`,
 		`CREATE INDEX IF NOT EXISTS idx_documents_source_hash ON documents(source_hash);`,
+		`CREATE TABLE IF NOT EXISTS document_images (
+			id INTEGER PRIMARY KEY,
+			document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+			chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+			ordinal INTEGER NOT NULL,
+			alt_text TEXT NOT NULL,
+			media_type TEXT NOT NULL,
+			data BLOB NOT NULL,
+			content_hash TEXT NOT NULL,
+			UNIQUE(document_id, ordinal)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_document_images_chunk_id ON document_images(chunk_id);`,
 		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?);`,
+		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt, now()); err != nil {
@@ -219,6 +245,10 @@ func (s *Store) Init() error {
 }
 
 func (s *Store) UpsertDocument(ctx context.Context, doc Document, chunks []Chunk, replace bool) error {
+	return s.UpsertDocumentWithImages(ctx, doc, chunks, nil, replace)
+}
+
+func (s *Store) UpsertDocumentWithImages(ctx context.Context, doc Document, chunks []Chunk, images []DocumentImage, replace bool) error {
 	tags, err := json.Marshal(doc.Tags)
 	if err != nil {
 		return err
@@ -254,11 +284,27 @@ func (s *Store) UpsertDocument(ctx context.Context, doc Document, chunks []Chunk
 	if err != nil {
 		return err
 	}
+	chunkIDs := make(map[int]int64, len(chunks))
 	for _, chunk := range chunks {
-		_, err = tx.ExecContext(ctx, `INSERT INTO chunks(document_id, ordinal, heading_path, heading_level, page_number, start_line, end_line, text, text_hash)
+		result, insertErr := tx.ExecContext(ctx, `INSERT INTO chunks(document_id, ordinal, heading_path, heading_level, page_number, start_line, end_line, text, text_hash)
 			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			doc.ID, chunk.Ordinal, chunk.HeadingPath, chunk.HeadingLevel, nullInt(chunk.PageNumber), chunk.StartLine, chunk.EndLine, chunk.Text, chunk.TextHash)
-		if err != nil {
+		if insertErr != nil {
+			return insertErr
+		}
+		chunkID, insertErr := result.LastInsertId()
+		if insertErr != nil {
+			return insertErr
+		}
+		chunkIDs[chunk.Ordinal] = chunkID
+	}
+	for _, image := range images {
+		chunkID, ok := chunkIDs[image.ChunkOrdinal]
+		if !ok {
+			return fmt.Errorf("image %d references missing chunk ordinal %d", image.Ordinal, image.ChunkOrdinal)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO document_images(document_id, chunk_id, ordinal, alt_text, media_type, data, content_hash)
+			VALUES(?, ?, ?, ?, ?, ?, ?)`, doc.ID, chunkID, image.Ordinal, image.Alt, image.MediaType, image.Data, image.ContentHash); err != nil {
 			return err
 		}
 	}
@@ -415,9 +461,41 @@ func (s *Store) Retrieve(ctx context.Context, opts RetrieveOptions) (RetrievalRe
 			Score:       chunk.Score,
 			Debug:       chunk.Debug,
 		}
-		out.Blocks = append(out.Blocks, ContextBlock{Source: source, Text: chunk.Text})
+		images, err := s.imagesForChunk(ctx, chunk.ChunkID)
+		if err != nil {
+			return RetrievalResult{}, err
+		}
+		out.Blocks = append(out.Blocks, ContextBlock{Source: source, Text: chunk.Text, Images: images})
 	}
 	return out, nil
+}
+
+func (s *Store) Image(ctx context.Context, id int64) (StoredImage, error) {
+	var image StoredImage
+	image.ID = id
+	err := s.db.QueryRowContext(ctx, `SELECT alt_text, media_type, data, content_hash FROM document_images WHERE id = ?`, id).
+		Scan(&image.Alt, &image.MediaType, &image.Data, &image.ContentHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return StoredImage{}, fmt.Errorf("image %d not found", id)
+	}
+	return image, err
+}
+
+func (s *Store) imagesForChunk(ctx context.Context, chunkID int64) ([]ImageRef, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, alt_text, media_type FROM document_images WHERE chunk_id = ? ORDER BY ordinal`, chunkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var images []ImageRef
+	for rows.Next() {
+		var image ImageRef
+		if err := rows.Scan(&image.ID, &image.Alt, &image.MediaType); err != nil {
+			return nil, err
+		}
+		images = append(images, image)
+	}
+	return images, rows.Err()
 }
 
 func (s *Store) retrieveWithQuery(ctx context.Context, opts RetrieveOptions, query string, fetchLimit int) (RetrievalResult, error) {

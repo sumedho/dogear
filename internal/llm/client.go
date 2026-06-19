@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 const (
@@ -36,6 +39,7 @@ type ChatRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature"`
+	Stream      bool      `json:"stream,omitempty"`
 }
 
 type ChatResponse struct {
@@ -86,47 +90,51 @@ func ConfigFromTOMLFile(path string) (Config, error) {
 }
 
 func ParseConfigTOML(content string) (Config, error) {
-	var config Config
-	section := ""
-	for lineNo, line := range strings.Split(content, "\n") {
-		line = stripTOMLComment(line)
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	type providerConfig struct {
+		BaseURL *string `toml:"base_url"`
+		APIKey  *string `toml:"api_key"`
+		Model   *string `toml:"model"`
+		Timeout *string `toml:"timeout"`
+	}
+	type configFile struct {
+		BaseURL  *string        `toml:"base_url"`
+		APIKey   *string        `toml:"api_key"`
+		Model    *string        `toml:"model"`
+		Timeout  *string        `toml:"timeout"`
+		Provider providerConfig `toml:"provider"`
+	}
+
+	var decoded configFile
+	if _, err := toml.Decode(content, &decoded); err != nil {
+		return Config{}, fmt.Errorf("invalid TOML: %w", err)
+	}
+
+	config := Config{}
+	apply := func(baseURL, apiKey, model, timeoutValue *string) error {
+		if baseURL != nil {
+			config.BaseURL = *baseURL
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
-			continue
+		if apiKey != nil {
+			config.APIKey = *apiKey
 		}
-		if section != "" && section != "provider" {
-			continue
+		if model != nil {
+			config.Model = *model
 		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return Config{}, fmt.Errorf("invalid TOML line %d: expected key = value", lineNo+1)
-		}
-		key = strings.TrimSpace(key)
-		parsed, err := parseTOMLString(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("invalid TOML line %d: %w", lineNo+1, err)
-		}
-		switch key {
-		case "base_url":
-			config.BaseURL = parsed
-		case "api_key":
-			config.APIKey = parsed
-		case "model":
-			config.Model = parsed
-		case "timeout":
-			timeout, err := time.ParseDuration(parsed)
+		if timeoutValue != nil {
+			timeout, err := time.ParseDuration(*timeoutValue)
 			if err != nil {
-				return Config{}, fmt.Errorf("invalid TOML line %d timeout: %w", lineNo+1, err)
+				return fmt.Errorf("invalid timeout: %w", err)
 			}
 			config.Timeout = timeout
-		default:
-			// Unknown keys are ignored so future config can be added without
-			// breaking older binaries.
 		}
+		return nil
+	}
+
+	if err := apply(decoded.BaseURL, decoded.APIKey, decoded.Model, decoded.Timeout); err != nil {
+		return Config{}, err
+	}
+	if err := apply(decoded.Provider.BaseURL, decoded.Provider.APIKey, decoded.Provider.Model, decoded.Provider.Timeout); err != nil {
+		return Config{}, err
 	}
 	return config, nil
 }
@@ -145,40 +153,6 @@ func MergeConfig(base Config, override Config) Config {
 		base.Timeout = override.Timeout
 	}
 	return base
-}
-
-func stripTOMLComment(line string) string {
-	inQuote := false
-	escaped := false
-	for i, r := range line {
-		if escaped {
-			escaped = false
-			continue
-		}
-		if r == '\\' && inQuote {
-			escaped = true
-			continue
-		}
-		if r == '"' {
-			inQuote = !inQuote
-			continue
-		}
-		if r == '#' && !inQuote {
-			return line[:i]
-		}
-	}
-	return line
-}
-
-func parseTOMLString(value string) (string, error) {
-	if len(value) < 2 || !strings.HasPrefix(value, `"`) || !strings.HasSuffix(value, `"`) {
-		return "", fmt.Errorf("expected quoted string")
-	}
-	var parsed string
-	if err := json.Unmarshal([]byte(value), &parsed); err != nil {
-		return "", err
-	}
-	return parsed, nil
 }
 
 func NewClient(config Config) (*Client, error) {
@@ -250,33 +224,138 @@ func (c *Client) DryRun(request ChatRequest) DryRun {
 }
 
 func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, error) {
-	body, err := json.Marshal(request)
+	resp, err := c.doChatRequest(ctx, request)
 	if err != nil {
 		return ChatResponse{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return ChatResponse{}, err
+	}
+	if err := providerStatusError(resp.StatusCode, body); err != nil {
+		return ChatResponse{}, err
+	}
+	return parseChatResponse(body)
+}
+
+func (c *Client) ChatStream(ctx context.Context, request ChatRequest, onDelta func(string) error) (ChatResponse, error) {
+	request.Stream = true
+	resp, err := c.doChatRequest(ctx, request)
+	if err != nil {
+		return ChatResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return ChatResponse{}, err
+		}
+		if err := providerStatusError(resp.StatusCode, body); err != nil {
+			return ChatResponse{}, err
+		}
+		result, err := parseChatResponse(body)
+		if err != nil {
+			return ChatResponse{}, err
+		}
+		if onDelta != nil {
+			if err := onDelta(result.Content); err != nil {
+				return ChatResponse{}, err
+			}
+		}
+		return result, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return ChatResponse{}, providerStatusError(resp.StatusCode, body)
+	}
+
+	var content strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			break
+		}
+		var event struct {
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			return ChatResponse{}, fmt.Errorf("malformed provider stream: %w", err)
+		}
+		if event.Error != nil {
+			return ChatResponse{}, fmt.Errorf("provider stream error: %s", event.Error.Message)
+		}
+		for _, choice := range event.Choices {
+			delta := choice.Delta.Content
+			if delta == "" {
+				delta = choice.Message.Content
+			}
+			if delta == "" {
+				continue
+			}
+			content.WriteString(delta)
+			if onDelta != nil {
+				if err := onDelta(delta); err != nil {
+					return ChatResponse{}, err
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return ChatResponse{}, err
+	}
+	answer := strings.TrimSpace(content.String())
+	if answer == "" {
+		return ChatResponse{}, errors.New("provider response contained empty content")
+	}
+	return ChatResponse{Content: answer}, nil
+}
+
+func (c *Client) doChatRequest(ctx context.Context, request ChatRequest) (*http.Response, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.BaseURL, bytes.NewReader(body))
 	if err != nil {
-		return ChatResponse{}, err
+		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if request.Stream {
+		httpReq.Header.Set("Accept", "text/event-stream")
+	}
 	if c.config.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.config.APIKey)
 	}
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return ChatResponse{}, err
+		return nil, err
 	}
-	defer resp.Body.Close()
+	return resp, nil
+}
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return ChatResponse{}, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return ChatResponse{}, fmt.Errorf("provider returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-
+func parseChatResponse(respBody []byte) (ChatResponse, error) {
 	var parsed struct {
 		Choices []struct {
 			Message struct {
@@ -295,4 +374,11 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, e
 		return ChatResponse{}, errors.New("provider response contained empty content")
 	}
 	return ChatResponse{Content: content}, nil
+}
+
+func providerStatusError(status int, body []byte) error {
+	if status >= 200 && status <= 299 {
+		return nil
+	}
+	return fmt.Errorf("provider returned HTTP %d: %s", status, strings.TrimSpace(string(body)))
 }

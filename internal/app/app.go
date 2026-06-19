@@ -2,12 +2,10 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/sumedho/dogear/internal/dogear"
 	"github.com/sumedho/dogear/internal/llm"
 )
 
@@ -25,6 +23,22 @@ type AskOptions struct {
 	DryRun     bool
 	ConfigPath string
 	Provider   ProviderOverride
+	History    []ConversationMessage
+}
+
+type ConversationMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type RetrieveOptions struct {
+	Query      string
+	DocumentID string
+	Limit      int
+}
+
+type Retriever interface {
+	Retrieve(context.Context, RetrieveOptions) (RetrievalResult, error)
 }
 
 type AskResult struct {
@@ -36,58 +50,29 @@ type AskResult struct {
 	DryRun      *llm.DryRun
 }
 
-type DocumentInfo struct {
-	ID            string   `json:"id"`
-	Title         string   `json:"title"`
-	Brand         string   `json:"brand,omitempty"`
-	Model         string   `json:"model,omitempty"`
-	Version       string   `json:"version,omitempty"`
-	SourcePath    string   `json:"source_path"`
-	SourceHash    string   `json:"source_hash"`
-	Tags          []string `json:"tags"`
-	CreatedAt     string   `json:"created_at"`
-	UpdatedAt     string   `json:"updated_at"`
-	ChunkCount    int      `json:"chunk_count"`
-	IndexedChunks int      `json:"indexed_chunks"`
-	PageCount     int      `json:"page_count"`
-}
-
-type SearchResult struct {
-	DocumentID  string     `json:"document_id"`
-	Title       string     `json:"title"`
-	HeadingPath string     `json:"heading_path"`
-	PageNumber  *int64     `json:"page_number"`
-	StartLine   int        `json:"start_line"`
-	EndLine     int        `json:"end_line"`
-	Snippet     string     `json:"snippet"`
-	Score       float64    `json:"score"`
-	Debug       *RankDebug `json:"debug,omitempty"`
-}
-
 type SourceRef struct {
-	Label       string     `json:"label"`
-	DocumentID  string     `json:"document_id"`
-	Title       string     `json:"title"`
-	Brand       string     `json:"brand,omitempty"`
-	Model       string     `json:"model,omitempty"`
-	HeadingPath string     `json:"heading_path"`
-	PageNumber  *int64     `json:"page_number"`
-	StartLine   int        `json:"start_line"`
-	EndLine     int        `json:"end_line"`
-	Score       float64    `json:"score"`
-	Debug       *RankDebug `json:"debug,omitempty"`
-}
-
-type RankDebug struct {
-	RawScore    float64  `json:"raw_score"`
-	RerankScore float64  `json:"rerank_score"`
-	Quality     string   `json:"quality"`
-	Reasons     []string `json:"reasons"`
+	Label       string  `json:"label"`
+	DocumentID  string  `json:"document_id"`
+	Title       string  `json:"title"`
+	Brand       string  `json:"brand,omitempty"`
+	Model       string  `json:"model,omitempty"`
+	HeadingPath string  `json:"heading_path"`
+	PageNumber  *int64  `json:"page_number"`
+	StartLine   int     `json:"start_line"`
+	EndLine     int     `json:"end_line"`
+	Score       float64 `json:"score"`
 }
 
 type ContextBlock struct {
-	Source SourceRef `json:"source"`
-	Text   string    `json:"text"`
+	Source SourceRef  `json:"source"`
+	Text   string     `json:"text"`
+	Images []ImageRef `json:"images,omitempty"`
+}
+
+type ImageRef struct {
+	ID        int64  `json:"id"`
+	Alt       string `json:"alt"`
+	MediaType string `json:"media_type"`
 }
 
 type RetrievalResult struct {
@@ -103,11 +88,11 @@ type AskResponse struct {
 	Retrieval   RetrievalResult `json:"retrieval"`
 }
 
-func Ask(ctx context.Context, store *dogear.Store, opts AskOptions) (AskResult, error) {
+func Ask(ctx context.Context, retriever Retriever, opts AskOptions) (AskResult, error) {
 	if opts.Limit <= 0 {
 		opts.Limit = 8
 	}
-	retrieval, err := store.Retrieve(ctx, dogear.RetrieveOptions{
+	retrieval, err := retriever.Retrieve(ctx, RetrieveOptions{
 		Query:      opts.Question,
 		DocumentID: opts.DocumentID,
 		Limit:      opts.Limit,
@@ -123,7 +108,7 @@ func Ask(ctx context.Context, store *dogear.Store, opts AskOptions) (AskResult, 
 	if err != nil {
 		return AskResult{}, err
 	}
-	messages := BuildAskMessages(retrieval)
+	messages := BuildAskMessagesWithHistory(retrieval, opts.History)
 	request := llm.BuildRequest(config.Model, messages)
 	if opts.DryRun && request.Model == "" {
 		request.Model = "<model>"
@@ -141,8 +126,8 @@ func Ask(ctx context.Context, store *dogear.Store, opts AskOptions) (AskResult, 
 	result := AskResult{
 		Model:       config.Model,
 		ProviderURL: client.DryRun(request).URL,
-		Sources:     SourceResponses(retrieval, false),
-		Retrieval:   RetrievalResponse(retrieval, false),
+		Sources:     sourceRefs(retrieval),
+		Retrieval:   retrieval,
 	}
 	if opts.DryRun {
 		dryRun := client.DryRun(request)
@@ -155,6 +140,39 @@ func Ask(ctx context.Context, store *dogear.Store, opts AskOptions) (AskResult, 
 	}
 	result.Answer = response.Content
 	return result, nil
+}
+
+func AskStream(ctx context.Context, retriever Retriever, opts AskOptions, onDelta func(string) error) (AskResult, error) {
+	if opts.DryRun {
+		return Ask(ctx, retriever, opts)
+	}
+	if opts.Limit <= 0 {
+		opts.Limit = 8
+	}
+	retrieval, err := retriever.Retrieve(ctx, RetrieveOptions{Query: opts.Question, DocumentID: opts.DocumentID, Limit: opts.Limit})
+	if err != nil {
+		return AskResult{}, err
+	}
+	if len(retrieval.Blocks) == 0 {
+		return AskResult{}, fmt.Errorf("no context found for %q", opts.Question)
+	}
+	config, err := ProviderConfig(opts.ConfigPath, opts.Provider)
+	if err != nil {
+		return AskResult{}, err
+	}
+	client, err := llm.NewClient(config)
+	if err != nil {
+		return AskResult{}, err
+	}
+	request := llm.BuildRequest(config.Model, BuildAskMessagesWithHistory(retrieval, opts.History))
+	response, err := client.ChatStream(ctx, request, onDelta)
+	if err != nil {
+		return AskResult{}, err
+	}
+	return AskResult{
+		Answer: response.Content, Model: config.Model, ProviderURL: client.DryRun(request).URL,
+		Sources: sourceRefs(retrieval), Retrieval: retrieval,
+	}, nil
 }
 
 func ProviderConfig(configPath string, override ProviderOverride) (llm.Config, error) {
@@ -188,8 +206,12 @@ func ProviderConfig(configPath string, override ProviderOverride) (llm.Config, e
 	return config, nil
 }
 
-func BuildAskMessages(retrieval dogear.RetrievalResult) []llm.Message {
-	return []llm.Message{
+func BuildAskMessages(retrieval RetrievalResult) []llm.Message {
+	return BuildAskMessagesWithHistory(retrieval, nil)
+}
+
+func BuildAskMessagesWithHistory(retrieval RetrievalResult, history []ConversationMessage) []llm.Message {
+	messages := []llm.Message{
 		{
 			Role: "system",
 			Content: strings.Join([]string{
@@ -198,14 +220,20 @@ func BuildAskMessages(retrieval dogear.RetrievalResult) []llm.Message {
 				"If the sources do not contain the answer, say that the sources do not contain enough information.",
 			}, " "),
 		},
-		{
-			Role:    "user",
-			Content: PromptContext(retrieval),
-		},
 	}
+	for _, message := range history {
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		content := strings.TrimSpace(message.Content)
+		if (role != "user" && role != "assistant") || content == "" {
+			continue
+		}
+		messages = append(messages, llm.Message{Role: role, Content: content})
+	}
+	messages = append(messages, llm.Message{Role: "user", Content: PromptContext(retrieval)})
+	return messages
 }
 
-func PromptContext(result dogear.RetrievalResult) string {
+func PromptContext(result RetrievalResult) string {
 	var builder strings.Builder
 	builder.WriteString("Question: ")
 	builder.WriteString(result.Query)
@@ -219,10 +247,10 @@ func PromptContext(result dogear.RetrievalResult) string {
 	return builder.String()
 }
 
-func FormatSource(source dogear.SourceRef) string {
+func FormatSource(source SourceRef) string {
 	parts := []string{source.Label, source.Title}
-	if source.PageNumber.Valid {
-		parts = append(parts, fmt.Sprintf("p.%d", source.PageNumber.Int64))
+	if source.PageNumber != nil {
+		parts = append(parts, fmt.Sprintf("p.%d", *source.PageNumber))
 	}
 	if source.HeadingPath != "" {
 		parts = append(parts, source.HeadingPath)
@@ -231,107 +259,10 @@ func FormatSource(source dogear.SourceRef) string {
 	return strings.Join(parts, " | ")
 }
 
-func DocumentInfoResponse(info dogear.DocumentInfo) DocumentInfo {
-	tags := info.Tags
-	if tags == nil {
-		tags = []string{}
-	}
-	return DocumentInfo{
-		ID:            info.ID,
-		Title:         info.Title,
-		Brand:         info.Brand,
-		Model:         info.Model,
-		Version:       info.Version,
-		SourcePath:    info.SourcePath,
-		SourceHash:    info.SourceHash,
-		Tags:          tags,
-		CreatedAt:     info.CreatedAt,
-		UpdatedAt:     info.UpdatedAt,
-		ChunkCount:    info.ChunkCount,
-		IndexedChunks: info.IndexedChunks,
-		PageCount:     info.PageCount,
-	}
-}
-
-func DocumentInfoResponses(infos []dogear.DocumentInfo) []DocumentInfo {
-	out := make([]DocumentInfo, 0, len(infos))
-	for _, info := range infos {
-		out = append(out, DocumentInfoResponse(info))
-	}
-	return out
-}
-
-func SearchResponses(results []dogear.SearchResult, includeDebug bool) []SearchResult {
-	out := make([]SearchResult, 0, len(results))
-	for _, result := range results {
-		out = append(out, SearchResult{
-			DocumentID:  result.DocumentID,
-			Title:       result.Title,
-			HeadingPath: result.HeadingPath,
-			PageNumber:  nullIntPtr(result.PageNumber),
-			StartLine:   result.StartLine,
-			EndLine:     result.EndLine,
-			Snippet:     result.Snippet,
-			Score:       result.Score,
-			Debug:       RankDebugResponse(result.Debug, includeDebug),
-		})
-	}
-	return out
-}
-
-func RetrievalResponse(result dogear.RetrievalResult, includeDebug bool) RetrievalResult {
-	out := RetrievalResult{
-		Query:  result.Query,
-		Blocks: make([]ContextBlock, 0, len(result.Blocks)),
-	}
-	for _, block := range result.Blocks {
-		out.Blocks = append(out.Blocks, ContextBlock{
-			Source: SourceResponse(block.Source, includeDebug),
-			Text:   block.Text,
-		})
-	}
-	return out
-}
-
-func SourceResponses(result dogear.RetrievalResult, includeDebug bool) []SourceRef {
+func sourceRefs(result RetrievalResult) []SourceRef {
 	sources := make([]SourceRef, 0, len(result.Blocks))
 	for _, block := range result.Blocks {
-		sources = append(sources, SourceResponse(block.Source, includeDebug))
+		sources = append(sources, block.Source)
 	}
 	return sources
-}
-
-func SourceResponse(source dogear.SourceRef, includeDebug bool) SourceRef {
-	return SourceRef{
-		Label:       source.Label,
-		DocumentID:  source.DocumentID,
-		Title:       source.Title,
-		Brand:       source.Brand,
-		Model:       source.Model,
-		HeadingPath: source.HeadingPath,
-		PageNumber:  nullIntPtr(source.PageNumber),
-		StartLine:   source.StartLine,
-		EndLine:     source.EndLine,
-		Score:       source.Score,
-		Debug:       RankDebugResponse(source.Debug, includeDebug),
-	}
-}
-
-func RankDebugResponse(debug dogear.RankDebug, include bool) *RankDebug {
-	if !include {
-		return nil
-	}
-	return &RankDebug{
-		RawScore:    debug.RawScore,
-		RerankScore: debug.RerankScore,
-		Quality:     debug.Quality,
-		Reasons:     debug.Reasons,
-	}
-}
-
-func nullIntPtr(value sql.NullInt64) *int64 {
-	if !value.Valid {
-		return nil
-	}
-	return &value.Int64
 }

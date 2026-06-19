@@ -3,10 +3,12 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,6 +95,53 @@ func TestClientChatWithOptionalAuth(t *testing.T) {
 	}
 }
 
+func TestClientChatStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if !request.Stream {
+			t.Fatal("stream = false, want true")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Use \"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"MIDI [1].\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL + "/v1", Model: "test-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deltas []string
+	response, err := client.ChatStream(context.Background(), BuildRequest("test-model", []Message{{Role: "user", Content: "question"}}), func(delta string) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Content != "Use MIDI [1]." || strings.Join(deltas, "") != response.Content {
+		t.Fatalf("response = %#v, deltas = %#v", response, deltas)
+	}
+}
+
+func TestClientChatStreamRejectsMalformedEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\n\n")
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, Model: "test-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ChatStream(context.Background(), BuildRequest("test-model", nil), nil); err == nil {
+		t.Fatal("ChatStream() error = nil, want malformed stream error")
+	}
+}
+
 func TestClientProviderErrors(t *testing.T) {
 	tests := map[string]struct {
 		status int
@@ -156,6 +205,59 @@ model = "ignored"
 	}
 	if config.BaseURL != "http://localhost:11434/v1" || config.APIKey != "secret#kept" || config.Model != "llama3.1" || config.Timeout != 15*time.Second {
 		t.Fatalf("unexpected config: %#v", config)
+	}
+}
+
+func TestParseConfigTOMLFeatures(t *testing.T) {
+	config, err := ParseConfigTOML(`
+model = "top-level"
+api_key = "top-level-key"
+
+[provider]
+model = """multi-line
+model"""
+api_key = '''literal#key'''
+timeout = "1m30s"
+features = ["chat", "embeddings"]
+
+[future.nested]
+enabled = true
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Model != "multi-line\nmodel" || config.APIKey != "literal#key" || config.Timeout != 90*time.Second {
+		t.Fatalf("unexpected config: %#v", config)
+	}
+}
+
+func TestParseConfigTOMLProviderEmptyValueOverridesTopLevel(t *testing.T) {
+	config, err := ParseConfigTOML(`
+api_key = "top-level-key"
+
+[provider]
+api_key = ""
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.APIKey != "" {
+		t.Fatalf("APIKey = %q, want empty", config.APIKey)
+	}
+}
+
+func TestParseConfigTOMLErrors(t *testing.T) {
+	tests := map[string]string{
+		"malformed":        `model = "unterminated`,
+		"wrong field type": `model = ["one", "two"]`,
+		"invalid timeout":  `timeout = "eventually"`,
+	}
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseConfigTOML(content); err == nil {
+				t.Fatal("ParseConfigTOML() error = nil, want error")
+			}
+		})
 	}
 }
 

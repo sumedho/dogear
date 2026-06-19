@@ -1,0 +1,68 @@
+export interface DocumentInfo {
+  id: string;
+  title: string;
+  brand?: string;
+  model?: string;
+  version?: string;
+  source_path: string;
+  tags: string[];
+  chunk_count: number;
+  page_count: number;
+}
+
+export interface ImageRef {
+  id: number;
+  alt: string;
+  media_type: string;
+}
+
+export interface SourceRef {
+  label: string;
+  document_id: string;
+  title: string;
+  brand?: string;
+  model?: string;
+  heading_path: string;
+  page_number: number | null;
+  start_line: number;
+  end_line: number;
+  score: number;
+}
+
+export interface ContextBlock {
+  source: SourceRef;
+  text: string;
+  images?: ImageRef[];
+}
+
+export interface RetrievalResult {
+  query: string;
+  blocks: ContextBlock[];
+}
+
+export interface AskResult {
+  answer: string;
+  model: string;
+  provider_url: string;
+  sources: SourceRef[];
+  retrieval: RetrievalResult;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  status?: "streaming" | "done" | "error" | "cancelled";
+  error?: string;
+  sources?: SourceRef[];
+  retrieval?: RetrievalResult;
+}
+
+export interface Chat {
+  id: string;
+  title: string;
+  documentId: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
+}

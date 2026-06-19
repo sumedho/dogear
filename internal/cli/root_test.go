@@ -162,6 +162,18 @@ Turn local control off from the MIDI settings page.
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Set local control off \"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"in MIDI settings [1].\"}}]}\n\ndata: [DONE]\n\n"))
+			return
+		}
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Set local control off in MIDI settings [1]."}}]}`))
 	}))
 	defer server.Close()
@@ -257,4 +269,36 @@ func runCLIFailure(t *testing.T, args ...string) string {
 		t.Fatalf("dogear %s succeeded unexpectedly\nstdout: %s", strings.Join(args, " "), out.String())
 	}
 	return err.Error()
+}
+
+func TestLoggingFlagsDoNotPolluteJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dogear.db")
+	runCLI(t, "init", "--db", dbPath)
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	command := newRootCommand(&out, &errOut)
+	command.SetArgs([]string{"list", "--db", dbPath, "--json", "--log-format", "json", "--log-level", "debug"})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var documents []any
+	if err := json.Unmarshal(out.Bytes(), &documents); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", err, out.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("unexpected diagnostics: %s", errOut.String())
+	}
+}
+
+func TestLoggingFlagsRejectInvalidValues(t *testing.T) {
+	for _, args := range [][]string{{"list", "--log-level", "trace"}, {"list", "--log-format", "yaml"}} {
+		var out bytes.Buffer
+		var errOut bytes.Buffer
+		command := newRootCommand(&out, &errOut)
+		command.SetArgs(args)
+		if err := command.Execute(); err == nil {
+			t.Fatalf("dogear %v succeeded unexpectedly", args)
+		}
+	}
 }

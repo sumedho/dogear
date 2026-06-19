@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,8 +28,29 @@ type ImportMetadata struct {
 }
 
 type ImportResult struct {
-	Documents int
-	Chunks    int
+	Documents int `json:"documents"`
+	Chunks    int `json:"chunks"`
+}
+
+const maxEmbeddedImageBytes = 25 << 20
+
+type DocumentImage struct {
+	ID           int64
+	DocumentID   string
+	ChunkID      int64
+	ChunkOrdinal int
+	Ordinal      int
+	Alt          string
+	MediaType    string
+	Data         []byte
+	ContentHash  string
+}
+
+type embeddedImage struct {
+	line      int
+	alt       string
+	mediaType string
+	data      []byte
 }
 
 type section struct {
@@ -38,12 +61,14 @@ type section struct {
 	startLine    int
 	endLine      int
 	lines        []string
+	lineNumbers  []int
 }
 
 var (
-	headingRE    = regexp.MustCompile(`^(#{1,6})\s+(.+?)\s*$`)
-	tocRowRE     = regexp.MustCompile(`^\|(.+?)\|\s*\.?\s*\.?\s*([0-9]{1,4})\s*\|`)
-	pageMarkerRE = regexp.MustCompile(`(?i)^<!--\s*(?:dogear:page=|page:\s*)([0-9]{1,5})\s*-->$`)
+	headingRE       = regexp.MustCompile(`^(#{1,6})\s+(.+?)\s*$`)
+	tocRowRE        = regexp.MustCompile(`^\|(.+?)\|\s*\.?\s*\.?\s*([0-9]{1,4})\s*\|`)
+	pageMarkerRE    = regexp.MustCompile(`(?i)^<!--\s*(?:dogear:page=|page:\s*)([0-9]{1,5})\s*-->$`)
+	embeddedImageRE = regexp.MustCompile(`^!\[([^]]*)\]\(data:(image/(?:png|jpeg|gif|webp));base64,([^)]*)\)\s*$`)
 )
 
 func ImportPath(ctx context.Context, store *Store, path string, meta ImportMetadata, replace bool) (ImportResult, error) {
@@ -60,11 +85,15 @@ func ImportPath(ctx context.Context, store *Store, path string, meta ImportMetad
 
 	var result ImportResult
 	for _, file := range files {
-		doc, chunks, err := parseMarkdownFile(file, meta)
+		raw, err := os.ReadFile(file)
 		if err != nil {
 			return ImportResult{}, err
 		}
-		if err := store.UpsertDocument(ctx, doc, chunks, replace); err != nil {
+		doc, chunks, images, err := parseMarkdown(file, raw, meta)
+		if err != nil {
+			return ImportResult{}, err
+		}
+		if err := store.UpsertDocumentWithImages(ctx, doc, chunks, images, replace); err != nil {
 			return ImportResult{}, err
 		}
 		result.Documents++
@@ -74,6 +103,23 @@ func ImportPath(ctx context.Context, store *Store, path string, meta ImportMetad
 		return ImportResult{}, err
 	}
 	return result, nil
+}
+
+func ImportMarkdown(ctx context.Context, store *Store, sourceName string, content []byte, meta ImportMetadata, replace bool) (ImportResult, error) {
+	if !isMarkdown(sourceName) {
+		return ImportResult{}, fmt.Errorf("%s is not a markdown file", sourceName)
+	}
+	doc, chunks, images, err := parseMarkdown(sourceName, content, meta)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	if err := store.UpsertDocumentWithImages(ctx, doc, chunks, images, replace); err != nil {
+		return ImportResult{}, err
+	}
+	if _, err := store.RebuildIndex(ctx); err != nil {
+		return ImportResult{}, err
+	}
+	return ImportResult{Documents: 1, Chunks: len(chunks)}, nil
 }
 
 func markdownFiles(path string) ([]string, error) {
@@ -115,7 +161,17 @@ func parseMarkdownFile(path string, meta ImportMetadata) (Document, []Chunk, err
 	if err != nil {
 		return Document{}, nil, err
 	}
+	doc, chunks, _, err := parseMarkdown(path, raw, meta)
+	return doc, chunks, err
+}
+
+func parseMarkdown(path string, raw []byte, meta ImportMetadata) (Document, []Chunk, []DocumentImage, error) {
 	lines := scanLines(string(raw))
+	cleanedLines, embedded, err := extractEmbeddedImages(lines)
+	if err != nil {
+		return Document{}, nil, nil, err
+	}
+	lines = cleanedLines
 	title := firstHeading(lines)
 	if meta.Title != "" {
 		title = meta.Title
@@ -147,12 +203,13 @@ func parseMarkdownFile(path string, meta ImportMetadata) (Document, []Chunk, err
 	pageMap := parseTOCPages(lines)
 	sections := splitSections(lines, pageMap)
 	chunks := chunksFromSections(doc.ID, sections)
-	return doc, chunks, nil
+	images := attachImagesToChunks(doc.ID, embedded, sections, chunks)
+	return doc, chunks, images, nil
 }
 
 func scanLines(content string) []string {
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	scanner.Buffer(make([]byte, 1024), 1024*1024)
+	scanner.Buffer(make([]byte, 1024), 128<<20)
 	var lines []string
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
@@ -215,6 +272,7 @@ func splitSections(lines []string, pageMap map[string]int) []section {
 		if match == nil {
 			if current != nil && !skipLine(line) {
 				current.lines = append(current.lines, line)
+				current.lineNumbers = append(current.lineNumbers, lineNo)
 			}
 			continue
 		}
@@ -280,9 +338,9 @@ func chunksFromSections(docID string, sections []section) []Chunk {
 		if isNonContentSection(sec.heading) {
 			continue
 		}
-		paragraphs := paragraphs(sec.lines)
+		paragraphs := paragraphs(sec.lines, sec.lineNumbers)
 		var buf []string
-		startLine := sec.startLine
+		startLine := 0
 		flush := func(endLine int) {
 			text := strings.TrimSpace(strings.Join(buf, "\n\n"))
 			if text == "" {
@@ -303,6 +361,9 @@ func chunksFromSections(docID string, sections []section) []Chunk {
 		}
 
 		for _, para := range paragraphs {
+			if len(buf) == 0 {
+				startLine = para.startLine
+			}
 			if len(strings.Join(buf, "\n\n"))+len(para.text) > maxChars && len(buf) > 0 {
 				flush(para.startLine - 1)
 				startLine = para.startLine
@@ -335,7 +396,7 @@ type paragraph struct {
 	endLine   int
 }
 
-func paragraphs(lines []string) []paragraph {
+func paragraphs(lines []string, lineNumbers []int) []paragraph {
 	var result []paragraph
 	var buf []string
 	start := 0
@@ -349,8 +410,11 @@ func paragraphs(lines []string) []paragraph {
 	}
 	for idx, line := range lines {
 		lineNo := idx + 1
+		if idx < len(lineNumbers) {
+			lineNo = lineNumbers[idx]
+		}
 		if strings.TrimSpace(line) == "" {
-			flush(lineNo - 1)
+			flush(lineNo)
 			continue
 		}
 		if start == 0 {
@@ -358,8 +422,80 @@ func paragraphs(lines []string) []paragraph {
 		}
 		buf = append(buf, line)
 	}
-	flush(len(lines))
+	endLine := len(lines)
+	if len(lineNumbers) > 0 {
+		endLine = lineNumbers[len(lineNumbers)-1]
+	}
+	flush(endLine)
 	return result
+}
+
+func extractEmbeddedImages(lines []string) ([]string, []embeddedImage, error) {
+	cleaned := append([]string(nil), lines...)
+	var images []embeddedImage
+	for i, line := range lines {
+		match := embeddedImageRE.FindStringSubmatch(strings.TrimSpace(line))
+		if match == nil {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(match[3])
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid embedded image on line %d: %w", i+1, err)
+		}
+		if len(data) > maxEmbeddedImageBytes {
+			return nil, nil, fmt.Errorf("embedded image on line %d exceeds %d bytes", i+1, maxEmbeddedImageBytes)
+		}
+		mediaType := strings.ToLower(match[2])
+		if detected := http.DetectContentType(data); detected != mediaType {
+			return nil, nil, fmt.Errorf("embedded image on line %d declares %s but contains %s", i+1, mediaType, detected)
+		}
+		alt := strings.TrimSpace(match[1])
+		if alt == "" {
+			alt = "Manual image"
+		}
+		images = append(images, embeddedImage{line: i + 1, alt: alt, mediaType: mediaType, data: data})
+		cleaned[i] = ""
+	}
+	return cleaned, images, nil
+}
+
+func attachImagesToChunks(documentID string, embedded []embeddedImage, sections []section, chunks []Chunk) []DocumentImage {
+	images := make([]DocumentImage, 0, len(embedded))
+	for i, image := range embedded {
+		var sectionPath string
+		for _, sec := range sections {
+			if image.line >= sec.startLine && image.line <= sec.endLine {
+				sectionPath = sec.headingPath
+				break
+			}
+		}
+		bestOrdinal := 0
+		bestDistance := int(^uint(0) >> 1)
+		for _, chunk := range chunks {
+			if sectionPath != "" && chunk.HeadingPath != sectionPath {
+				continue
+			}
+			distance := 0
+			switch {
+			case image.line < chunk.StartLine:
+				distance = chunk.StartLine - image.line
+			case image.line > chunk.EndLine:
+				distance = image.line - chunk.EndLine
+			}
+			if distance < bestDistance {
+				bestDistance = distance
+				bestOrdinal = chunk.Ordinal
+			}
+		}
+		if bestOrdinal == 0 {
+			continue
+		}
+		images = append(images, DocumentImage{
+			DocumentID: documentID, ChunkOrdinal: bestOrdinal, Ordinal: i + 1,
+			Alt: image.alt, MediaType: image.mediaType, Data: image.data, ContentHash: hashBytes(image.data),
+		})
+	}
+	return images
 }
 
 func skipLine(line string) bool {
@@ -450,6 +586,11 @@ func isQueryStopword(term string) bool {
 func hashString(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+func hashBytes(value []byte) string {
+	hash := sha256.Sum256(value)
+	return hex.EncodeToString(hash[:])
 }
 
 func cleanTags(tags []string) []string {

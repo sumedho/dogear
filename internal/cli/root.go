@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
+	dogearadapter "github.com/sumedho/dogear/internal/adapters/dogear"
 	"github.com/sumedho/dogear/internal/app"
 	"github.com/sumedho/dogear/internal/dogear"
+	"github.com/sumedho/dogear/internal/logging"
 	"github.com/sumedho/dogear/internal/server"
 )
 
@@ -21,16 +24,36 @@ type rootOptions struct {
 	configPath string
 	out        io.Writer
 	errOut     io.Writer
+	logLevel   string
+	logFormat  string
+	logFile    string
+	logger     *slog.Logger
+	logCloser  io.Closer
 }
 
 func NewRootCommand() *cobra.Command {
-	return newRootCommand(os.Stdout, os.Stderr)
+	command, _ := newRootCommandWithOptions(os.Stdout, os.Stderr)
+	return command
 }
 
 func newRootCommand(out, errOut io.Writer) *cobra.Command {
+	command, _ := newRootCommandWithOptions(out, errOut)
+	return command
+}
+
+func Execute() error {
+	command, opts := newRootCommandWithOptions(os.Stdout, os.Stderr)
+	defer opts.closeLogger()
+	return command.Execute()
+}
+
+func newRootCommandWithOptions(out, errOut io.Writer) (*cobra.Command, *rootOptions) {
 	opts := rootOptions{
-		out:    out,
-		errOut: errOut,
+		out:       out,
+		errOut:    errOut,
+		logLevel:  "info",
+		logFormat: "text",
+		logger:    logging.Discard(),
 	}
 
 	root := &cobra.Command{
@@ -41,6 +64,21 @@ func newRootCommand(out, errOut io.Writer) *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&opts.dbPath, "db", "", "SQLite database path (default .dogear/dogear.db)")
 	root.PersistentFlags().StringVar(&opts.configPath, "config", "", "TOML config path (default .dogear/config.toml)")
+	root.PersistentFlags().StringVar(&opts.logLevel, "log-level", "info", "diagnostic log level: debug, info, warn, error")
+	root.PersistentFlags().StringVar(&opts.logFormat, "log-format", "text", "diagnostic log format: text or json")
+	root.PersistentFlags().StringVar(&opts.logFile, "log-file", "", "append diagnostic logs to this file instead of stderr")
+	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		logger, closer, err := logging.New(logging.Config{Level: opts.logLevel, Format: opts.logFormat, File: opts.logFile}, opts.errOut)
+		if err != nil {
+			return err
+		}
+		opts.logger = logger
+		opts.logCloser = closer
+		return nil
+	}
+	root.PersistentPostRun = func(cmd *cobra.Command, args []string) {
+		opts.closeLogger()
+	}
 
 	root.AddCommand(newInitCommand(&opts))
 	root.AddCommand(newImportCommand(&opts))
@@ -65,7 +103,14 @@ func newRootCommand(out, errOut io.Writer) *cobra.Command {
 		return cmd.Help()
 	}
 
-	return root
+	return root, &opts
+}
+
+func (opts *rootOptions) closeLogger() {
+	if opts.logCloser != nil {
+		_ = opts.logCloser.Close()
+		opts.logCloser = nil
+	}
 }
 
 func writeJSON(out io.Writer, value any) error {
@@ -392,7 +437,7 @@ func runServe(cmd *cobra.Command, opts *rootOptions, addr string) error {
 		displayAddr = net.JoinHostPort("127.0.0.1", port)
 	}
 	fmt.Fprintf(opts.out, "serving http://%s\n", displayAddr)
-	return server.Serve(cmd.Context(), addr, store, resolveConfigPath(opts.configPath))
+	return server.Serve(cmd.Context(), addr, store, resolveConfigPath(opts.configPath), opts.logger)
 }
 
 func newInitCommand(opts *rootOptions) *cobra.Command {
@@ -751,7 +796,7 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 			}
 			defer store.Close()
 
-			result, err := app.Ask(cmd.Context(), store, app.AskOptions{
+			askOptions := app.AskOptions{
 				Question:   args[0],
 				DocumentID: docID,
 				Limit:      limit,
@@ -763,7 +808,26 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 					Model:   model,
 					Timeout: timeoutValue,
 				},
-			})
+			}
+			retriever := dogearadapter.NewRetriever(store)
+			if !dryRun && !jsonOut {
+				result, err := app.AskStream(cmd.Context(), retriever, askOptions, func(delta string) error {
+					_, err := fmt.Fprint(opts.out, delta)
+					return err
+				})
+				if err != nil {
+					return err
+				}
+				fmt.Fprintln(opts.out)
+				fmt.Fprintln(opts.out)
+				fmt.Fprintln(opts.out, "Sources:")
+				for _, source := range result.Sources {
+					fmt.Fprintf(opts.out, "%s\n", formatAppSource(source))
+				}
+				return nil
+			}
+
+			result, err := app.Ask(cmd.Context(), retriever, askOptions)
 			if err != nil {
 				return err
 			}
@@ -782,12 +846,6 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 				})
 			}
 
-			fmt.Fprintln(opts.out, result.Answer)
-			fmt.Fprintln(opts.out)
-			fmt.Fprintln(opts.out, "Sources:")
-			for _, source := range result.Sources {
-				fmt.Fprintf(opts.out, "%s\n", formatAppSource(source))
-			}
 			return nil
 		},
 	}

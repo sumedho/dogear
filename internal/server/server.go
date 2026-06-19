@@ -5,14 +5,20 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	dogearadapter "github.com/sumedho/dogear/internal/adapters/dogear"
 	"github.com/sumedho/dogear/internal/app"
 	"github.com/sumedho/dogear/internal/dogear"
 	"github.com/sumedho/dogear/internal/llm"
+	"github.com/sumedho/dogear/internal/logging"
 )
 
 //go:embed static/*
@@ -21,23 +27,27 @@ var staticFiles embed.FS
 type Options struct {
 	Store      *dogear.Store
 	ConfigPath string
+	Logger     *slog.Logger
 }
 
 type Handler struct {
 	store      *dogear.Store
+	retriever  app.Retriever
 	configPath string
+	logger     *slog.Logger
 	mux        *http.ServeMux
 }
 
 type askRequest struct {
-	Question string `json:"question"`
-	Document string `json:"doc"`
-	Limit    int    `json:"limit"`
-	DryRun   bool   `json:"dry_run"`
-	BaseURL  string `json:"base_url"`
-	APIKey   string `json:"api_key"`
-	Model    string `json:"model"`
-	Timeout  string `json:"timeout"`
+	Question string                    `json:"question"`
+	Document string                    `json:"doc"`
+	Limit    int                       `json:"limit"`
+	DryRun   bool                      `json:"dry_run"`
+	BaseURL  string                    `json:"base_url"`
+	APIKey   string                    `json:"api_key"`
+	Model    string                    `json:"model"`
+	Timeout  string                    `json:"timeout"`
+	History  []app.ConversationMessage `json:"history"`
 }
 
 type askResponse struct {
@@ -58,9 +68,15 @@ type errorResponse struct {
 }
 
 func New(options Options) http.Handler {
+	logger := options.Logger
+	if logger == nil {
+		logger = logging.Discard()
+	}
 	handler := &Handler{
 		store:      options.Store,
+		retriever:  dogearadapter.NewRetriever(options.Store),
 		configPath: options.ConfigPath,
+		logger:     logger,
 		mux:        http.NewServeMux(),
 	}
 	handler.routes()
@@ -68,7 +84,62 @@ func New(options Options) http.Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
+	started := time.Now()
+	response := &loggingResponseWriter{ResponseWriter: w}
+	h.mux.ServeHTTP(response, r)
+	status := response.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	level := slog.LevelInfo
+	if status >= 500 {
+		level = slog.LevelError
+	} else if status >= 400 {
+		level = slog.LevelWarn
+	}
+	h.logger.LogAttrs(r.Context(), level, "http request",
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+		slog.Int("status", status),
+		slog.Int("bytes", response.bytes),
+		slog.Int64("duration_ms", time.Since(started).Milliseconds()),
+	)
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *loggingResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *loggingResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(data)
+	w.bytes += n
+	return n, err
+}
+
+func (w *loggingResponseWriter) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (h *Handler) routes() {
@@ -78,12 +149,83 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/search", h.search)
 	h.mux.HandleFunc("GET /api/context", h.context)
 	h.mux.HandleFunc("POST /api/ask", h.ask)
+	h.mux.HandleFunc("POST /api/ask/stream", h.askStream)
+	h.mux.HandleFunc("POST /api/import", h.importMarkdown)
+	h.mux.HandleFunc("GET /api/images/{id}", h.image)
 
 	static, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		panic(err)
 	}
 	h.mux.Handle("/", http.FileServer(http.FS(static)))
+}
+
+func (h *Handler) importMarkdown(w http.ResponseWriter, r *http.Request) {
+	const maxFileBytes = 100 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxFileBytes+(1<<20))
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid multipart upload: %w", err))
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("file is required: %w", err))
+		return
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, maxFileBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(content) > maxFileBytes {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("Markdown file exceeds %d bytes", maxFileBytes))
+		return
+	}
+	meta := dogear.ImportMetadata{
+		ID: strings.TrimSpace(r.FormValue("id")), Title: strings.TrimSpace(r.FormValue("title")),
+		Brand: strings.TrimSpace(r.FormValue("brand")), Model: strings.TrimSpace(r.FormValue("model")),
+		Version: strings.TrimSpace(r.FormValue("version")),
+	}
+	if tags := strings.TrimSpace(r.FormValue("tags")); tags != "" {
+		meta.Tags = strings.Split(tags, ",")
+	}
+	result, err := dogear.ImportMarkdown(r.Context(), h.store, filepath.Base(header.Filename), content, meta, parseBool(r.FormValue("replace")))
+	if err != nil {
+		h.logger.WarnContext(r.Context(), "markdown import failed", "filename", filepath.Base(header.Filename), "error", err)
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	h.logger.InfoContext(r.Context(), "markdown imported", "filename", filepath.Base(header.Filename), "documents", result.Documents, "chunks", result.Chunks)
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (h *Handler) image(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid image id"))
+		return
+	}
+	image, err := h.store.Image(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	etag := `"` + image.ContentHash + `"`
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", image.MediaType)
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("Content-Length", strconv.Itoa(len(image.Data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(image.Data)
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
@@ -96,7 +238,7 @@ func (h *Handler) documents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, app.DocumentInfoResponses(documents))
+	writeJSON(w, http.StatusOK, documentInfoResponses(documents))
 }
 
 func (h *Handler) document(w http.ResponseWriter, r *http.Request) {
@@ -105,7 +247,7 @@ func (h *Handler) document(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, app.DocumentInfoResponse(info))
+	writeJSON(w, http.StatusOK, documentInfoResponseFor(info))
 }
 
 func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
@@ -130,7 +272,7 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, app.SearchResponses(results, debug))
+	writeJSON(w, http.StatusOK, searchResultResponses(results, debug))
 }
 
 func (h *Handler) context(w http.ResponseWriter, r *http.Request) {
@@ -155,7 +297,7 @@ func (h *Handler) context(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, app.RetrievalResponse(result, debug))
+	writeJSON(w, http.StatusOK, retrievalResultResponseFor(result, debug))
 }
 
 func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +311,68 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
 		return
 	}
-	result, err := app.Ask(r.Context(), h.store, app.AskOptions{
+	result, err := app.Ask(r.Context(), h.retriever, h.askOptions(request))
+	if err != nil {
+		h.logger.ErrorContext(r.Context(), "ask failed", "stream", false, "error", err)
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	h.logger.InfoContext(r.Context(), "ask completed", "stream", false, "dry_run", request.DryRun, "model", result.Model, "sources", len(result.Sources))
+	writeJSON(w, http.StatusOK, askResponse{
+		Answer:      result.Answer,
+		Model:       result.Model,
+		ProviderURL: result.ProviderURL,
+		Sources:     result.Sources,
+		Retrieval:   result.Retrieval,
+		DryRun:      result.DryRun,
+	})
+}
+
+func (h *Handler) askStream(w http.ResponseWriter, r *http.Request) {
+	var request askRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
+		return
+	}
+	request.Question = strings.TrimSpace(request.Question)
+	if request.Question == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("streaming is not supported"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	result, err := app.AskStream(r.Context(), h.retriever, h.askOptions(request), func(delta string) error {
+		if err := writeSSE(w, "delta", map[string]string{"content": delta}); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	})
+	if err != nil {
+		h.logger.ErrorContext(r.Context(), "ask failed", "stream", true, "error", err)
+		_ = writeSSE(w, "error", errorResponse{Error: err.Error()})
+		flusher.Flush()
+		return
+	}
+	h.logger.InfoContext(r.Context(), "ask completed", "stream", true, "model", result.Model, "sources", len(result.Sources))
+	_ = writeSSE(w, "result", askResponse{
+		Answer: result.Answer, Model: result.Model, ProviderURL: result.ProviderURL,
+		Sources: result.Sources, Retrieval: result.Retrieval,
+	})
+	flusher.Flush()
+}
+
+func (h *Handler) askOptions(request askRequest) app.AskOptions {
+	return app.AskOptions{
 		Question:   request.Question,
 		DocumentID: strings.TrimSpace(request.Document),
 		Limit:      request.Limit,
@@ -181,19 +384,17 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 			Model:   request.Model,
 			Timeout: request.Timeout,
 		},
-	})
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
-		return
+		History: request.History,
 	}
-	writeJSON(w, http.StatusOK, askResponse{
-		Answer:      result.Answer,
-		Model:       result.Model,
-		ProviderURL: result.ProviderURL,
-		Sources:     result.Sources,
-		Retrieval:   result.Retrieval,
-		DryRun:      result.DryRun,
-	})
+}
+
+func writeSSE(w io.Writer, event string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	return err
 }
 
 func parseLimit(r *http.Request, fallback int) (int, error) {
@@ -227,11 +428,15 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, errorResponse{Error: err.Error()})
 }
 
-func Serve(ctx context.Context, addr string, store *dogear.Store, configPath string) error {
+func Serve(ctx context.Context, addr string, store *dogear.Store, configPath string, logger *slog.Logger) error {
+	if logger == nil {
+		logger = logging.Discard()
+	}
 	server := &http.Server{
 		Addr:    addr,
-		Handler: New(Options{Store: store, ConfigPath: configPath}),
+		Handler: New(Options{Store: store, ConfigPath: configPath, Logger: logger}),
 	}
+	logger.InfoContext(ctx, "server starting", "addr", addr)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- server.ListenAndServe()
@@ -239,13 +444,17 @@ func Serve(ctx context.Context, addr string, store *dogear.Store, configPath str
 	select {
 	case <-ctx.Done():
 		if err := server.Shutdown(context.Background()); err != nil {
+			logger.Error("server shutdown failed", "error", err)
 			return err
 		}
+		logger.Info("server stopped", "reason", "context cancelled")
 		return ctx.Err()
 	case err := <-errCh:
 		if err == http.ErrServerClosed {
+			logger.Info("server stopped", "reason", "closed")
 			return nil
 		}
+		logger.Error("server failed", "error", err)
 		return err
 	}
 }

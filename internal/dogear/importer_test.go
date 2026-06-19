@@ -2,10 +2,13 @@ package dogear
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+const testPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
 func TestSlug(t *testing.T) {
 	got := Slug("Yamaha DX7 Owner's Manual")
@@ -179,6 +182,55 @@ Turn local control off in the MIDI configuration page.
 	}
 	if len(retrieval.Blocks) == 0 {
 		t.Fatal("expected fallback retrieval results")
+	}
+}
+
+func TestImportMarkdownStoresEmbeddedImagesWithRetrievedChunk(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "dogear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("# Image Manual\n\n## Local Control\n\nTurn local control off here.\n\n![Control diagram](data:image/png;base64," + testPNGBase64 + ")\n")
+	if _, err := ImportMarkdown(context.Background(), store, "manual.md", content, ImportMetadata{ID: "image-manual"}, false); err != nil {
+		t.Fatal(err)
+	}
+	retrieval, err := store.Retrieve(context.Background(), RetrieveOptions{Query: "local control", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retrieval.Blocks) == 0 || len(retrieval.Blocks[0].Images) != 1 {
+		t.Fatalf("unexpected retrieval: %#v", retrieval)
+	}
+	ref := retrieval.Blocks[0].Images[0]
+	if ref.Alt != "Control diagram" || ref.MediaType != "image/png" {
+		t.Fatalf("unexpected image ref: %#v", ref)
+	}
+	stored, err := store.Image(context.Background(), ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := base64.StdEncoding.DecodeString(testPNGBase64)
+	if string(stored.Data) != string(want) || stored.ContentHash == "" {
+		t.Fatalf("unexpected stored image: %#v", stored)
+	}
+}
+
+func TestImportMarkdownRejectsInvalidEmbeddedImage(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "dogear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("# Manual\n\n## Setup\n\nText.\n\n![Wrong](data:image/jpeg;base64," + testPNGBase64 + ")\n")
+	if _, err := ImportMarkdown(context.Background(), store, "manual.md", content, ImportMetadata{}, false); err == nil {
+		t.Fatal("ImportMarkdown() error = nil, want MIME mismatch")
 	}
 }
 

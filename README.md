@@ -146,7 +146,7 @@ Use `--dry-run` to print the provider URL, redacted headers, and JSON body witho
 
 ## Local Web UI and JSON API
 
-Serve the embedded HTML/JavaScript UI from the same database and config used by the CLI:
+Serve the embedded React chat UI from the same database and config used by the CLI:
 
 ```sh
 ./dogear serve
@@ -170,6 +170,47 @@ curl -X POST http://127.0.0.1:8765/api/ask \
   -H 'Content-Type: application/json' \
   -d '{"question":"How do I turn off local control?","dry_run":true}'
 ```
+
+The web UI keeps chats in browser storage, supports a manual per chat (or all
+manuals), streams answers, and can import `.md` or `.markdown` files. Embedded
+base64 PNG, JPEG, GIF, and WebP images are stored outside the search index and
+shown with relevant retrieved sources.
+
+The streaming endpoint uses server-sent events:
+
+```sh
+curl -N -X POST http://127.0.0.1:8765/api/ask/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"How do I turn off local control?","history":[]}'
+```
+
+To rebuild the embedded frontend after editing `web/`:
+
+```sh
+cd web
+npm ci
+npm test
+npm run build
+```
+
+The generated files under `internal/server/static/` are embedded in the Go
+binary and should be committed with frontend source changes.
+
+## Diagnostic Logging
+
+Command results, JSON, and streamed answers are written to stdout. Operational
+diagnostics are structured separately with Go's `slog` package and default to
+human-readable records on stderr.
+
+```sh
+./dogear serve --log-level debug
+./dogear serve --log-format json
+./dogear serve --log-format json --log-file .dogear/dogear.log
+```
+
+Supported levels are `debug`, `info`, `warn`, and `error`. Setting `--log-file`
+redirects diagnostics to that append-only file instead of stderr. Log rotation
+and retention are the responsibility of the process supervisor or deployment.
 
 ## Not Implemented Yet
 
