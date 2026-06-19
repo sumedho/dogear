@@ -62,6 +62,7 @@ type askResponse struct {
 	ProviderURL string              `json:"provider_url"`
 	Sources     []app.SourceRef     `json:"sources"`
 	Retrieval   app.RetrievalResult `json:"retrieval"`
+	Images      []app.DisplayImage  `json:"images,omitempty"`
 	DryRun      *llm.DryRun         `json:"dry_run,omitempty"`
 }
 
@@ -586,6 +587,7 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		ProviderURL: result.ProviderURL,
 		Sources:     result.Sources,
 		Retrieval:   result.Retrieval,
+		Images:      result.Images,
 		DryRun:      result.DryRun,
 	})
 }
@@ -628,7 +630,7 @@ func (h *Handler) askStream(w http.ResponseWriter, r *http.Request) {
 	h.logger.InfoContext(r.Context(), "ask completed", "stream", true, "model", result.Model, "sources", len(result.Sources))
 	_ = writeSSE(w, "result", askResponse{
 		Answer: result.Answer, Model: result.Model, ProviderURL: result.ProviderURL,
-		Sources: result.Sources, Retrieval: result.Retrieval,
+		Sources: result.Sources, Retrieval: result.Retrieval, Images: result.Images,
 	})
 	flusher.Flush()
 }

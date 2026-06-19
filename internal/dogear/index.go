@@ -15,7 +15,11 @@ func (s *Store) RebuildIndex(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO chunks_fts(chunk_id, document_id, title, brand, model, heading_path, text)
-		SELECT c.id, c.document_id, d.title, d.brand, d.model, c.heading_path, c.text
+		SELECT c.id, c.document_id, d.title, d.brand, d.model, c.heading_path,
+			c.text || CASE WHEN EXISTS(SELECT 1 FROM document_images di WHERE di.chunk_id = c.id)
+				THEN char(10) || char(10) || 'Images:' || char(10) ||
+					(SELECT group_concat(di.alt_text, char(10)) FROM document_images di WHERE di.chunk_id = c.id)
+				ELSE '' END
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE lower(c.heading_path) NOT LIKE '%table of contents%'

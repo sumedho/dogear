@@ -58,6 +58,7 @@ type SearchResult struct {
 	StartLine   int
 	EndLine     int
 	Snippet     string
+	Images      []ImageRef
 	Score       float64
 	Debug       RankDebug
 }

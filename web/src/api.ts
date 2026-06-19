@@ -24,6 +24,15 @@ export function listDocumentChunks(documentId: string, after = 0): Promise<Docum
 export function getDocumentChunk(documentId: string, chunkId: number): Promise<DocumentChunk> {
   return json(`/api/documents/${encodeURIComponent(documentId)}/chunks/${chunkId}`);
 }
+export async function loadDocumentChunks(documentId: string, chunkId?: number): Promise<DocumentChunk[]> {
+  const firstPagePromise = listDocumentChunks(documentId);
+  if (!chunkId) return firstPagePromise;
+  const [firstPage, target] = await Promise.all([firstPagePromise, getDocumentChunk(documentId, chunkId)]);
+  if (firstPage.some((item) => item.id === target.id)) return firstPage;
+  const targetPage = await listDocumentChunks(documentId, Math.max(0, target.ordinal - 1));
+  if (targetPage.some((item) => item.id === target.id)) return targetPage;
+  return [target, ...targetPage].sort((left, right) => left.ordinal - right.ordinal);
+}
 export async function getSettings(): Promise<Settings> {
   const settings = await json<Settings>("/api/settings");
   return { ...settings, environment_overrides: settings.environment_overrides ?? [] };

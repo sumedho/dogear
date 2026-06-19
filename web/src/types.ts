@@ -16,6 +16,10 @@ export interface ImageRef {
   media_type: string;
 }
 
+export interface DisplayImage extends ImageRef {
+  source: SourceRef;
+}
+
 export interface SourceRef {
   chunk_id: number;
   label: string;
@@ -47,6 +51,7 @@ export interface AskResult {
   provider_url: string;
   sources: SourceRef[];
   retrieval: RetrievalResult;
+  images?: DisplayImage[];
 }
 
 export interface ChatMessage {
@@ -57,6 +62,7 @@ export interface ChatMessage {
   error?: string;
   sources?: SourceRef[];
   retrieval?: RetrievalResult;
+  images?: DisplayImage[];
 }
 
 export interface Chat {

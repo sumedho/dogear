@@ -80,11 +80,12 @@ func TestPromptContext(t *testing.T) {
 		Blocks: []ContextBlock{{
 			Source: SourceRef{Label: "[1]", Title: "Manual", PageNumber: &page, HeadingPath: "Setup", StartLine: 2, EndLine: 4},
 			Text:   "Use this setting.",
+			Images: []ImageRef{{ID: 9, Alt: "Front panel", MediaType: "image/png"}},
 		}},
 	}
 
 	prompt := PromptContext(retrieval)
-	for _, want := range []string{"Question: How?", "[1] | Manual | p.7 | Setup | lines 2-4", "Use this setting."} {
+	for _, want := range []string{"Question: How?", "[1] | Manual | p.7 | Setup | lines 2-4", "Use this setting.", `image 9: "Front panel" (image/png) from [1]`} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt %q does not contain %q", prompt, want)
 		}
@@ -92,6 +93,33 @@ func TestPromptContext(t *testing.T) {
 	messages := BuildAskMessages(retrieval)
 	if len(messages) != 2 || messages[1].Content != prompt {
 		t.Fatalf("unexpected messages: %#v", messages)
+	}
+	if !strings.Contains(messages[0].Content, "displayed below") || !strings.Contains(messages[0].Content, "cannot inspect image pixels") {
+		t.Fatalf("system prompt is not image-aware: %q", messages[0].Content)
+	}
+}
+
+func TestDisplayImagesForImageRequests(t *testing.T) {
+	source := SourceRef{Label: "[1]", DocumentID: "synth", ChunkID: 12, Title: "Manual"}
+	retrieval := RetrievalResult{Blocks: []ContextBlock{
+		{Source: source, Images: []ImageRef{{ID: 4, Alt: "Front panel", MediaType: "image/png"}}},
+		{Source: SourceRef{Label: "[2]"}, Images: []ImageRef{{ID: 4, Alt: "Duplicate", MediaType: "image/png"}, {ID: 5, Alt: "Rear panel", MediaType: "image/jpeg"}}},
+	}}
+
+	images := displayImages("Display the front panel", retrieval)
+	if len(images) != 2 || images[0].ID != 4 || images[0].Source.ChunkID != 12 || images[1].ID != 5 {
+		t.Fatalf("unexpected display images: %#v", images)
+	}
+	if images := displayImages("How do I change the MIDI channel?", retrieval); len(images) != 0 {
+		t.Fatalf("ordinary question returned display images: %#v", images)
+	}
+	for _, question := range []string{"show a picture", "front panel layout", "is there a schematic?", "display the rear panel"} {
+		if !wantsImages(question) {
+			t.Fatalf("wantsImages(%q) = false", question)
+		}
+	}
+	if wantsImages("show me how to configure MIDI") {
+		t.Fatal("generic show request was classified as image intent")
 	}
 }
 

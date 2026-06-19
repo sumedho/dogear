@@ -195,11 +195,18 @@ func TestImportMarkdownStoresEmbeddedImagesWithRetrievedChunk(t *testing.T) {
 	if err := store.Init(); err != nil {
 		t.Fatal(err)
 	}
-	content := []byte("# Image Manual\n\n## Local Control\n\nTurn local control off here.\n\n![Control diagram](data:image/png;base64," + testPNGBase64 + ")\n")
+	content := []byte("# Image Manual\n\n## Local Control\n\nTurn local control off here.\n\n![Signal flow schematic](data:image/png;base64," + testPNGBase64 + ")\n")
 	if _, err := ImportMarkdown(context.Background(), store, "manual.md", content, ImportMetadata{ID: "image-manual"}, false); err != nil {
 		t.Fatal(err)
 	}
-	retrieval, err := store.Retrieve(context.Background(), RetrieveOptions{Query: "local control", Limit: 2})
+	results, err := store.Search(context.Background(), SearchOptions{Query: "signal flow schematic", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || len(results[0].Images) != 1 || results[0].Images[0].Alt != "Signal flow schematic" {
+		t.Fatalf("image alt search returned %#v", results)
+	}
+	retrieval, err := store.Retrieve(context.Background(), RetrieveOptions{Query: "signal flow schematic", Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +214,15 @@ func TestImportMarkdownStoresEmbeddedImagesWithRetrievedChunk(t *testing.T) {
 		t.Fatalf("unexpected retrieval: %#v", retrieval)
 	}
 	ref := retrieval.Blocks[0].Images[0]
-	if ref.Alt != "Control diagram" || ref.MediaType != "image/png" {
+	if ref.Alt != "Signal flow schematic" || ref.MediaType != "image/png" {
 		t.Fatalf("unexpected image ref: %#v", ref)
+	}
+	embeddingChunks, err := store.EmbeddingChunks(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(embeddingChunks) != 1 || !strings.Contains(embeddingChunks[0].Text, "Signal flow schematic") {
+		t.Fatalf("image alt missing from embedding input: %#v", embeddingChunks)
 	}
 	stored, err := store.Image(context.Background(), ref.ID)
 	if err != nil {
@@ -217,6 +231,51 @@ func TestImportMarkdownStoresEmbeddedImagesWithRetrievedChunk(t *testing.T) {
 	want, _ := base64.StdEncoding.DecodeString(testPNGBase64)
 	if string(stored.Data) != string(want) || stored.ContentHash == "" {
 		t.Fatalf("unexpected stored image: %#v", stored)
+	}
+}
+
+func TestInitMigratesExistingImageSearchIndex(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "dogear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("# Image Manual\n\n## Routing\n\nThis section contains an illustration.\n\n![Rare waveform diagram](data:image/png;base64," + testPNGBase64 + ")\n")
+	if _, err := ImportMarkdown(context.Background(), store, "manual.md", content, ImportMetadata{ID: "migration-image"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM chunks_fts;
+		INSERT INTO chunks_fts(chunk_id, document_id, title, brand, model, heading_path, text)
+		SELECT c.id, c.document_id, d.title, d.brand, d.model, c.heading_path, c.text FROM chunks c JOIN documents d ON d.id = c.document_id;
+		DELETE FROM schema_migrations WHERE version = 4;`); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Search(context.Background(), SearchOptions{Query: "rare waveform diagram", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 0 {
+		t.Fatalf("legacy index unexpectedly found image alt text: %#v", before)
+	}
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.Search(context.Background(), SearchOptions{Query: "rare waveform diagram", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 1 || len(after[0].Images) != 1 {
+		t.Fatalf("migrated image search returned %#v", after)
+	}
+	report, err := store.Doctor(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SchemaVersion != schemaVersion {
+		t.Fatalf("schema version = %d, want %d", report.SchemaVersion, schemaVersion)
 	}
 }
 

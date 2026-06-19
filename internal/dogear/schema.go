@@ -1,6 +1,8 @@
 package dogear
 
-const schemaVersion = 3
+import "context"
+
+const schemaVersion = 4
 
 func (s *Store) Init() error {
 	stmts := []string{
@@ -70,6 +72,21 @@ func (s *Store) Init() error {
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt, now()); err != nil {
+			return err
+		}
+	}
+	var version int
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&version); err != nil {
+		return err
+	}
+	if version < schemaVersion {
+		if _, err := s.RebuildIndex(context.Background()); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`UPDATE embedding_index_state SET complete = 0`); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, schemaVersion, now()); err != nil {
 			return err
 		}
 	}

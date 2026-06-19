@@ -75,6 +75,7 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 					ProviderURL: result.ProviderURL,
 					Sources:     result.Sources,
 					Retrieval:   result.Retrieval,
+					Images:      result.Images,
 				})
 			}
 

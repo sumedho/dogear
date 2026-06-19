@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/sumedho/dogear/internal/llm"
 )
@@ -47,6 +48,7 @@ type AskResult struct {
 	ProviderURL string
 	Sources     []SourceRef `json:"sources"`
 	Retrieval   RetrievalResult
+	Images      []DisplayImage `json:"images,omitempty"`
 	DryRun      *llm.DryRun
 }
 
@@ -76,6 +78,13 @@ type ImageRef struct {
 	MediaType string `json:"media_type"`
 }
 
+type DisplayImage struct {
+	ID        int64     `json:"id"`
+	Alt       string    `json:"alt"`
+	MediaType string    `json:"media_type"`
+	Source    SourceRef `json:"source"`
+}
+
 type RetrievalResult struct {
 	Query  string         `json:"query"`
 	Blocks []ContextBlock `json:"blocks"`
@@ -87,6 +96,7 @@ type AskResponse struct {
 	ProviderURL string          `json:"provider_url"`
 	Sources     []SourceRef     `json:"sources"`
 	Retrieval   RetrievalResult `json:"retrieval"`
+	Images      []DisplayImage  `json:"images,omitempty"`
 }
 
 func Ask(ctx context.Context, retriever Retriever, opts AskOptions) (AskResult, error) {
@@ -129,6 +139,7 @@ func Ask(ctx context.Context, retriever Retriever, opts AskOptions) (AskResult, 
 		ProviderURL: client.DryRun(request).URL,
 		Sources:     sourceRefs(retrieval),
 		Retrieval:   retrieval,
+		Images:      displayImages(opts.Question, retrieval),
 	}
 	if opts.DryRun {
 		dryRun := client.DryRun(request)
@@ -172,7 +183,7 @@ func AskStream(ctx context.Context, retriever Retriever, opts AskOptions, onDelt
 	}
 	return AskResult{
 		Answer: response.Content, Model: config.Model, ProviderURL: client.DryRun(request).URL,
-		Sources: sourceRefs(retrieval), Retrieval: retrieval,
+		Sources: sourceRefs(retrieval), Retrieval: retrieval, Images: displayImages(opts.Question, retrieval),
 	}, nil
 }
 
@@ -218,6 +229,9 @@ func BuildAskMessagesWithHistory(retrieval RetrievalResult, history []Conversati
 			Content: strings.Join([]string{
 				"You answer questions using only the provided sources.",
 				"Cite factual claims with source labels like [1] or [2].",
+				"Source image metadata may be provided; you cannot inspect image pixels, but the application can display listed images.",
+				"If the user asks to show or display a relevant listed image, say that it is displayed below and cite its source; do not claim that the image is unavailable.",
+				"Do not infer visual details beyond the source text and image alt text.",
 				"If the sources do not contain the answer, say that the sources do not contain enough information.",
 			}, " "),
 		},
@@ -243,9 +257,52 @@ func PromptContext(result RetrievalResult) string {
 		builder.WriteString(FormatSource(block.Source))
 		builder.WriteString("\n")
 		builder.WriteString(block.Text)
+		if len(block.Images) > 0 {
+			builder.WriteString("\nAvailable source images:\n")
+			for _, image := range block.Images {
+				fmt.Fprintf(&builder, "- image %d: %q (%s) from %s\n", image.ID, image.Alt, image.MediaType, block.Source.Label)
+			}
+		}
 		builder.WriteString("\n\n")
 	}
 	return builder.String()
+}
+
+func displayImages(question string, result RetrievalResult) []DisplayImage {
+	if !wantsImages(question) {
+		return nil
+	}
+	seen := make(map[int64]bool)
+	var images []DisplayImage
+	for _, block := range result.Blocks {
+		for _, image := range block.Images {
+			if seen[image.ID] {
+				continue
+			}
+			seen[image.ID] = true
+			images = append(images, DisplayImage{ID: image.ID, Alt: image.Alt, MediaType: image.MediaType, Source: block.Source})
+		}
+	}
+	return images
+}
+
+func wantsImages(question string) bool {
+	question = strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return unicode.ToLower(r)
+		}
+		return ' '
+	}, question)
+	question = " " + strings.Join(strings.Fields(question), " ") + " "
+	for _, term := range []string{
+		"image", "picture", "photo", "diagram", "schematic", "illustration", "figure",
+		"front panel", "rear panel", "back panel", "panel layout", "visual reference",
+	} {
+		if strings.Contains(question, " "+term+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 func FormatSource(source SourceRef) string {

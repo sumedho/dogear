@@ -29,6 +29,7 @@ type searchResultResponse struct {
 	StartLine   int                `json:"start_line"`
 	EndLine     int                `json:"end_line"`
 	Snippet     string             `json:"snippet"`
+	Images      []imageRefResponse `json:"images,omitempty"`
 	Score       float64            `json:"score"`
 	Debug       *rankDebugResponse `json:"debug,omitempty"`
 }
@@ -62,8 +63,9 @@ type rankDebugResponse struct {
 }
 
 type contextBlockResponse struct {
-	Source sourceRefResponse `json:"source"`
-	Text   string            `json:"text"`
+	Source sourceRefResponse  `json:"source"`
+	Text   string             `json:"text"`
+	Images []imageRefResponse `json:"images,omitempty"`
 }
 
 type retrievalResultResponse struct {
@@ -99,10 +101,7 @@ func documentChunkResponses(chunks []dogear.DocumentChunk) []documentChunkRespon
 }
 
 func documentChunkResponseFor(chunk dogear.DocumentChunk) documentChunkResponse {
-	images := make([]imageRefResponse, 0, len(chunk.Images))
-	for _, image := range chunk.Images {
-		images = append(images, imageRefResponse{ID: image.ID, Alt: image.Alt, MediaType: image.MediaType})
-	}
+	images := imageRefResponses(chunk.Images)
 	return documentChunkResponse{ID: chunk.ID, DocumentID: chunk.DocumentID, Ordinal: chunk.Ordinal, HeadingPath: chunk.HeadingPath,
 		HeadingLevel: chunk.HeadingLevel, PageNumber: sqlutil.Int64Ptr(chunk.PageNumber), StartLine: chunk.StartLine, EndLine: chunk.EndLine, Text: chunk.Text, Images: images}
 }
@@ -134,7 +133,7 @@ func searchResultResponses(results []dogear.SearchResult, includeDebug bool) []s
 		out = append(out, searchResultResponse{
 			DocumentID: result.DocumentID, Title: result.Title, HeadingPath: result.HeadingPath,
 			PageNumber: sqlutil.Int64Ptr(result.PageNumber), StartLine: result.StartLine, EndLine: result.EndLine,
-			Snippet: result.Snippet, Score: result.Score, Debug: rankDebugResponseFor(result.Debug, includeDebug),
+			Snippet: result.Snippet, Images: imageRefResponses(result.Images), Score: result.Score, Debug: rankDebugResponseFor(result.Debug, includeDebug),
 		})
 	}
 	return out
@@ -146,7 +145,16 @@ func retrievalResultResponseFor(result dogear.RetrievalResult, includeDebug bool
 		out.Blocks = append(out.Blocks, contextBlockResponse{
 			Source: sourceRefResponseFor(block.Source, includeDebug),
 			Text:   block.Text,
+			Images: imageRefResponses(block.Images),
 		})
+	}
+	return out
+}
+
+func imageRefResponses(images []dogear.ImageRef) []imageRefResponse {
+	out := make([]imageRefResponse, 0, len(images))
+	for _, image := range images {
+		out = append(out, imageRefResponse{ID: image.ID, Alt: image.Alt, MediaType: image.MediaType})
 	}
 	return out
 }

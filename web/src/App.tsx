@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { buildEmbeddingIndex, embeddingIndexStatus, getDocumentChunk, getSettings, importMarkdown, listDocumentChunks, listDocuments, saveSettings, streamAsk, testSettings } from "./api";
+import { buildEmbeddingIndex, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, saveSettings, streamAsk, testSettings } from "./api";
 import { loadChats, newChat, saveChats } from "./storage";
-import type { AskResult, Chat, ChatMessage, DocumentChunk, DocumentInfo, EmbeddingIndexStatus, Settings, SourceRef } from "./types";
+import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentInfo, EmbeddingIndexStatus, Settings, SourceRef } from "./types";
 
 function sourceDescription(source: SourceRef): string {
   const parts = [source.title];
@@ -118,6 +118,7 @@ export default function App() {
               status: "done",
               sources: result.sources,
               retrieval: result.retrieval,
+			  images: result.images,
             } : message),
             updatedAt: Date.now(),
           })),
@@ -195,6 +196,7 @@ export default function App() {
                 {message.role === "assistant" ? (
                   <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content || (message.status === "streaming" ? "Searching the manual…" : "")}</ReactMarkdown></div>
                 ) : <div className="user-text">{message.content}</div>}
+				{message.images && message.images.length > 0 && <AnswerImages images={message.images} onOpen={openViewer} />}
                 {message.status === "streaming" && <span className="streaming-cursor" aria-label="Streaming" />}
                 {message.error && <div className={`message-error ${message.status === "cancelled" ? "muted" : ""}`}>{message.error}</div>}
                 {message.sources && message.sources.length > 0 && <SourceCards message={message} onOpen={openViewer} />}
@@ -233,6 +235,17 @@ export default function App() {
       {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar" />}
     </div>
   );
+}
+
+function AnswerImages({ images, onOpen }: { images: DisplayImage[]; onOpen(documentId: string, chunkId?: number): void }) {
+  return <div className="answer-images" aria-label="Retrieved images">
+    {images.map((image) => <figure key={image.id}>
+      <button onClick={() => onOpen(image.source.document_id, image.source.chunk_id)} aria-label={`Open ${image.alt} in manual`}>
+        <img src={`/api/images/${image.id}`} alt={image.alt} loading="lazy" />
+      </button>
+      <figcaption>{image.alt} <span>{image.source.label}</span></figcaption>
+    </figure>)}
+  </div>;
 }
 
 function SourceCards({ message, onOpen }: { message: ChatMessage; onOpen(documentId: string, chunkId?: number): void }) {
@@ -279,8 +292,8 @@ function ManualViewer({ manual, documentId, chunkId, onClose }: { manual?: Docum
   const [error, setError] = useState("");
   useEffect(() => {
     let active = true; setLoading(true);
-    Promise.all([listDocumentChunks(documentId), chunkId ? getDocumentChunk(documentId, chunkId) : Promise.resolve(undefined)]).then(([page, target]) => {
-      if (!active) return; const combined = target && !page.some((item) => item.id === target.id) ? [target, ...page] : page; setChunks(combined); setLoading(false);
+    loadDocumentChunks(documentId, chunkId).then((page) => {
+	  if (!active) return; setChunks(page); setLoading(false);
       setTimeout(() => document.getElementById(`chunk-${chunkId}`)?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
     }).catch((reason) => { if (active) { setError(reason instanceof Error ? reason.message : "Could not load manual"); setLoading(false); } });
     return () => { active = false; };

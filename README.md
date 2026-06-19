@@ -1,6 +1,10 @@
 # Dogear
 
-Dogear is a local CLI for searching Markdown manuals with SQLite FTS5. It is aimed at synthesizer manuals and other reference documents that have already been converted to Markdown.
+Dogear is a local CLI and web application for searching and asking questions
+about Markdown manuals. It combines SQLite FTS5 search, optional sqlite-vec
+embeddings, local reranking, and citation-grounded answers from
+OpenAI-compatible providers. It is aimed at synthesizer manuals and other
+reference documents that have already been converted to Markdown.
 
 ## Build
 
@@ -126,6 +130,13 @@ Build the optional sqlite-vec index explicitly:
 ./dogear index --embeddings
 ```
 
+Use `--force` to rebuild embeddings even when the current index matches the
+configured model, dimensions, and document set:
+
+```sh
+./dogear index --embeddings --force
+```
+
 Search, context, ask, and the web API use hybrid FTS/vector retrieval when the
 embedding index is current. They fall back to FTS when it is missing, stale, or
 the embedding endpoint is unavailable. Imports mark the vector index stale.
@@ -136,6 +147,13 @@ heading/page/text selectors. Compare modes with:
 ```sh
 ./dogear eval evaluation.json --mode both
 ./dogear eval evaluation.json --mode hybrid --answers --json
+```
+
+Evaluation runs can enforce minimum quality gates for CI or model comparisons:
+
+```sh
+./dogear eval evaluation.json --mode both \
+  --min-mrr 0.75 --min-recall-at-5 0.90
 ```
 
 Local-first defaults target Ollama-style endpoints, so this is enough for many local setups:
@@ -200,8 +218,11 @@ curl -X POST http://127.0.0.1:8765/api/ask \
 
 The web UI keeps chats in browser storage, supports a manual per chat (or all
 manuals), streams answers, and can import `.md` or `.markdown` files. Embedded
-base64 PNG, JPEG, GIF, and WebP images are stored outside the search index and
-shown with relevant retrieved sources.
+base64 PNG, JPEG, GIF, and WebP image data is stored outside the search index,
+while image alt text participates in FTS and embedding retrieval. Matching
+images are returned with search and context results and shown with relevant
+sources. When a question explicitly requests an image, matching retrieved
+images are also displayed inline beneath the answer.
 
 Citation cards open a deep-linked manual viewer at the retrieved chunk. The
 Settings panel edits masked chat/embedding configuration, tests both endpoints,
@@ -227,6 +248,21 @@ npm run build
 The generated files under `internal/server/static/` are embedded in the Go
 binary and should be committed with frontend source changes.
 
+## Architecture
+
+Dogear keeps application behavior separate from delivery and persistence:
+
+- `internal/app` contains provider-independent question-answering workflows.
+- `internal/adapters/dogear` adapts the persistence retrieval interface for the
+  application layer.
+- `internal/dogear` contains focused SQLite components for schema management,
+  document CRUD, FTS indexing, search, retrieval, images, embeddings, and
+  diagnostics. Narrow interfaces in `interfaces.go` define these capabilities.
+- `internal/cli` defines each Cobra command in a dedicated command file and
+  keeps shared JSON and text formatting separate.
+- `internal/server` exposes the JSON/SSE API and embeds the React frontend from
+  `internal/server/static`.
+
 ## Diagnostic Logging
 
 Command results, JSON, and streamed answers are written to stdout. Operational
@@ -243,12 +279,14 @@ Supported levels are `debug`, `info`, `warn`, and `error`. Setting `--log-file`
 redirects diagnostics to that append-only file instead of stderr. Log rotation
 and retention are the responsibility of the process supervisor or deployment.
 
-## Not Implemented Yet
+## Roadmap
 
-These commands are placeholders:
+Document conversion is the remaining placeholder command:
 
 ```sh
 ./dogear convert
 ```
 
-Future milestones include sqlite-vec vector search, hybrid retrieval, and conversion pipelines.
+SQLite vector search, hybrid retrieval, retrieval evaluation, streaming
+answers, and embedding-index management are implemented. Native conversion
+and OCR pipelines for PDF and other source formats are planned next.

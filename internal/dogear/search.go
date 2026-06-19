@@ -47,6 +47,10 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]SearchResult,
 	reranked := rerankChunks(opts.Query, chunks, opts.Limit)
 	out := make([]SearchResult, 0, len(reranked))
 	for _, chunk := range reranked {
+		images, err := s.imagesForChunk(ctx, chunk.ChunkID)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, SearchResult{
 			ChunkID:     chunk.ChunkID,
 			DocumentID:  chunk.DocumentID,
@@ -56,6 +60,7 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]SearchResult,
 			StartLine:   chunk.StartLine,
 			EndLine:     chunk.EndLine,
 			Snippet:     snippets[chunk.ChunkID],
+			Images:      images,
 			Score:       chunk.Score,
 			Debug:       chunk.Debug,
 		})
@@ -72,7 +77,7 @@ func (s *Store) SearchHybrid(ctx context.Context, opts SearchOptions, queryVecto
 	for _, block := range retrieval.Blocks {
 		results = append(results, SearchResult{ChunkID: block.Source.ChunkID, DocumentID: block.Source.DocumentID, Title: block.Source.Title,
 			HeadingPath: block.Source.HeadingPath, PageNumber: block.Source.PageNumber, StartLine: block.Source.StartLine, EndLine: block.Source.EndLine,
-			Snippet: block.Text, Score: block.Source.Score, Debug: block.Source.Debug})
+			Snippet: block.Text, Images: block.Images, Score: block.Source.Score, Debug: block.Source.Debug})
 	}
 	return results, nil
 }

@@ -37,7 +37,12 @@ func (s *Store) EmbeddingStatus(ctx context.Context, model string, dimensions in
 }
 
 func (s *Store) EmbeddingChunks(ctx context.Context) ([]EmbeddingChunk, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.document_id, d.title, c.heading_path, c.text, c.text_hash
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.document_id, d.title, c.heading_path,
+		c.text || CASE WHEN EXISTS(SELECT 1 FROM document_images di WHERE di.chunk_id = c.id)
+			THEN char(10) || char(10) || 'Images:' || char(10) ||
+				(SELECT group_concat(di.alt_text, char(10)) FROM document_images di WHERE di.chunk_id = c.id)
+			ELSE '' END,
+		c.text_hash || ':' || COALESCE((SELECT group_concat(di.content_hash, ':') FROM document_images di WHERE di.chunk_id = c.id), '')
 		FROM chunks c JOIN documents d ON d.id = c.document_id ORDER BY c.id`)
 	if err != nil {
 		return nil, err

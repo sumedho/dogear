@@ -214,7 +214,7 @@ func TestImportAndServeEmbeddedImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	markdown := "# Images\n\n## Diagram\n\nThe control diagram explains local control.\n\n![Diagram](data:image/png;base64," + serverTestPNGBase64 + ")\n"
+	markdown := "# Images\n\n## Diagram\n\nThis section contains the relevant illustration.\n\n![Signal flow schematic](data:image/png;base64," + serverTestPNGBase64 + ")\n"
 	if _, err := part.Write([]byte(markdown)); err != nil {
 		t.Fatal(err)
 	}
@@ -228,12 +228,44 @@ func TestImportAndServeEmbeddedImage(t *testing.T) {
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	retrieval, err := store.Retrieve(context.Background(), dogear.RetrieveOptions{Query: "control diagram", DocumentID: "images", Limit: 1})
-	if err != nil {
+	searchRequest := httptest.NewRequest(http.MethodGet, "/api/search?q=signal+flow+schematic&doc=images", nil)
+	searchResponse := httptest.NewRecorder()
+	handler.ServeHTTP(searchResponse, searchRequest)
+	var searchResults []searchResultResponse
+	if searchResponse.Code != http.StatusOK {
+		t.Fatalf("search status = %d, body = %s", searchResponse.Code, searchResponse.Body.String())
+	}
+	if err := json.Unmarshal(searchResponse.Body.Bytes(), &searchResults); err != nil {
+		t.Fatal(err)
+	}
+	if len(searchResults) != 1 || len(searchResults[0].Images) != 1 || searchResults[0].Images[0].Alt != "Signal flow schematic" {
+		t.Fatalf("unexpected image search response: %#v", searchResults)
+	}
+	contextRequest := httptest.NewRequest(http.MethodGet, "/api/context?q=signal+flow+schematic&doc=images", nil)
+	contextResponse := httptest.NewRecorder()
+	handler.ServeHTTP(contextResponse, contextRequest)
+	var retrieval retrievalResultResponse
+	if contextResponse.Code != http.StatusOK {
+		t.Fatalf("context status = %d, body = %s", contextResponse.Code, contextResponse.Body.String())
+	}
+	if err := json.Unmarshal(contextResponse.Body.Bytes(), &retrieval); err != nil {
 		t.Fatal(err)
 	}
 	if len(retrieval.Blocks) != 1 || len(retrieval.Blocks[0].Images) != 1 {
-		t.Fatalf("unexpected retrieval: %#v", retrieval)
+		t.Fatalf("unexpected context response: %#v", retrieval)
+	}
+	askRequest := httptest.NewRequest(http.MethodPost, "/api/ask", strings.NewReader(`{"question":"display the signal flow schematic","doc":"images","dry_run":true,"model":"test-model"}`))
+	askResponseRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(askResponseRecorder, askRequest)
+	var answer askResponse
+	if askResponseRecorder.Code != http.StatusOK {
+		t.Fatalf("ask status = %d, body = %s", askResponseRecorder.Code, askResponseRecorder.Body.String())
+	}
+	if err := json.Unmarshal(askResponseRecorder.Body.Bytes(), &answer); err != nil {
+		t.Fatal(err)
+	}
+	if len(answer.Images) != 1 || answer.Images[0].Alt != "Signal flow schematic" || answer.Images[0].Source.DocumentID != "images" {
+		t.Fatalf("unexpected answer images: %#v", answer.Images)
 	}
 	imageRequest := httptest.NewRequest(http.MethodGet, "/api/images/"+strconv.FormatInt(retrieval.Blocks[0].Images[0].ID, 10), nil)
 	imageResponse := httptest.NewRecorder()

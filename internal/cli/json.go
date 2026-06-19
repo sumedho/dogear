@@ -38,6 +38,7 @@ type searchResultJSON struct {
 	StartLine   int            `json:"start_line"`
 	EndLine     int            `json:"end_line"`
 	Snippet     string         `json:"snippet"`
+	Images      []imageRefJSON `json:"images,omitempty"`
 	Score       float64        `json:"score"`
 	Debug       *rankDebugJSON `json:"debug,omitempty"`
 }
@@ -84,8 +85,15 @@ type rankDebugJSON struct {
 }
 
 type contextBlockJSON struct {
-	Source sourceRefJSON `json:"source"`
-	Text   string        `json:"text"`
+	Source sourceRefJSON  `json:"source"`
+	Text   string         `json:"text"`
+	Images []imageRefJSON `json:"images,omitempty"`
+}
+
+type imageRefJSON struct {
+	ID        int64  `json:"id"`
+	Alt       string `json:"alt"`
+	MediaType string `json:"media_type"`
 }
 
 type retrievalResultJSON struct {
@@ -152,6 +160,7 @@ func searchResultResponses(results []dogear.SearchResult, includeDebug bool) []s
 			StartLine:   result.StartLine,
 			EndLine:     result.EndLine,
 			Snippet:     result.Snippet,
+			Images:      imageRefJSONResponses(result.Images),
 			Score:       result.Score,
 			Debug:       rankDebugResponse(result.Debug, includeDebug),
 		})
@@ -187,7 +196,16 @@ func retrievalResultResponse(result dogear.RetrievalResult, includeDebug bool) r
 		out.Blocks = append(out.Blocks, contextBlockJSON{
 			Source: sourceRefResponse(block.Source, includeDebug),
 			Text:   block.Text,
+			Images: imageRefJSONResponses(block.Images),
 		})
+	}
+	return out
+}
+
+func imageRefJSONResponses(images []dogear.ImageRef) []imageRefJSON {
+	out := make([]imageRefJSON, 0, len(images))
+	for _, image := range images {
+		out = append(out, imageRefJSON{ID: image.ID, Alt: image.Alt, MediaType: image.MediaType})
 	}
 	return out
 }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getSettings, SSEParser } from "./api";
+import { getSettings, loadDocumentChunks, SSEParser } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -12,6 +12,28 @@ describe("getSettings", () => {
     }), { status: 200 })));
 
     await expect(getSettings()).resolves.toMatchObject({ environment_overrides: [] });
+  });
+});
+
+describe("loadDocumentChunks", () => {
+  it("loads the target ordinal window when a deep-linked chunk is outside the first page", async () => {
+    const chunk = (id: number, ordinal: number, heading: string) => ({
+      id, document_id: "manual", ordinal, heading_path: heading, heading_level: 2,
+      page_number: null, start_line: ordinal, end_line: ordinal, text: heading,
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/chunks/900")) return new Response(JSON.stringify(chunk(900, 90, "10.8.5 PRB")));
+      if (url.includes("after=89")) return new Response(JSON.stringify([
+        chunk(900, 90, "10.8.5 PRB"),
+        chunk(901, 91, "10.8.6 Next section"),
+      ]));
+      return new Response(JSON.stringify([chunk(1, 1, "FCC compliance statement")]));
+    }));
+
+    const chunks = await loadDocumentChunks("manual", 900);
+
+    expect(chunks.map((item) => item.heading_path)).toEqual(["10.8.5 PRB", "10.8.6 Next section"]);
   });
 });
 
