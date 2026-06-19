@@ -1,0 +1,5 @@
+[provider]
+base_url = "http://localhost:11434/v1"
+model = ""
+api_key = ""
+timeout = "60s"
