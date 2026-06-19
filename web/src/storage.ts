@@ -4,7 +4,7 @@ export const storageKey = "dogear.chats.v1";
 
 export function newChat(): Chat {
   const now = Date.now();
-  return { id: crypto.randomUUID(), title: "New chat", documentId: "", messages: [], createdAt: now, updatedAt: now };
+  return { id: crypto.randomUUID(), title: "New chat", documentId: "", draft: "", messages: [], createdAt: now, updatedAt: now };
 }
 
 export function loadChats(storage: Pick<Storage, "getItem"> = localStorage): Chat[] {
@@ -12,7 +12,9 @@ export function loadChats(storage: Pick<Storage, "getItem"> = localStorage): Cha
     const value = storage.getItem(storageKey);
     if (!value) return [];
     const parsed = JSON.parse(value) as Chat[];
-    return Array.isArray(parsed) ? parsed.filter((chat) => chat && typeof chat.id === "string" && Array.isArray(chat.messages)) : [];
+    return Array.isArray(parsed) ? parsed
+      .filter((chat) => chat && typeof chat.id === "string" && Array.isArray(chat.messages))
+      .map((chat) => ({ ...chat, draft: typeof chat.draft === "string" ? chat.draft : "" })) : [];
   } catch {
     return [];
   }

@@ -9,10 +9,15 @@ describe("chat storage", () => {
       getItem: (key: string) => values.get(key) ?? null,
       setItem: (key: string, value: string) => void values.set(key, value),
     };
-    const chats: Chat[] = [{ id: "one", title: "MIDI", documentId: "manual", messages: [], createdAt: 1, updatedAt: 2 }];
+    const chats: Chat[] = [{ id: "one", title: "MIDI", documentId: "manual", draft: "clock setup", messages: [], createdAt: 1, updatedAt: 2 }];
     saveChats(chats, storage);
     expect(values.has(storageKey)).toBe(true);
     expect(loadChats(storage)).toEqual(chats);
+  });
+
+  it("adds an empty draft to legacy chats", () => {
+    const legacy = [{ id: "one", title: "MIDI", documentId: "manual", messages: [], createdAt: 1, updatedAt: 2 }];
+    expect(loadChats({ getItem: () => JSON.stringify(legacy) })[0].draft).toBe("");
   });
 
   it("ignores malformed state", () => {

@@ -155,6 +155,8 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/health", h.health)
 	h.mux.HandleFunc("GET /api/documents", h.documents)
 	h.mux.HandleFunc("GET /api/documents/{id}", h.document)
+	h.mux.HandleFunc("DELETE /api/documents/{id}", h.removeDocument)
+	h.mux.HandleFunc("GET /api/documents/{id}/health", h.documentHealth)
 	h.mux.HandleFunc("GET /api/documents/{id}/chunks", h.documentChunks)
 	h.mux.HandleFunc("GET /api/documents/{id}/chunks/{chunkID}", h.documentChunk)
 	h.mux.HandleFunc("GET /api/search", h.search)
@@ -365,6 +367,25 @@ func (h *Handler) embeddingIndexStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
+func (h *Handler) documentHealth(w http.ResponseWriter, r *http.Request) {
+	config, err := h.resolvedEmbedding(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	status, err := h.store.EmbeddingStatus(r.Context(), config.Model, config.Dimensions, config.IndexHash())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	health, err := h.store.DocumentHealth(r.Context(), r.PathValue("id"), status)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, health)
+}
+
 func (h *Handler) buildEmbeddingIndex(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -462,7 +483,7 @@ func (h *Handler) importMarkdown(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	h.logger.InfoContext(r.Context(), "markdown imported", "filename", filepath.Base(header.Filename), "documents", result.Documents, "chunks", result.Chunks)
+	h.logger.InfoContext(r.Context(), "markdown imported", "filename", filepath.Base(header.Filename), "documents", result.Documents, "chunks", result.Chunks, "images", result.Images)
 	writeJSON(w, http.StatusCreated, result)
 }
 
@@ -511,6 +532,15 @@ func (h *Handler) document(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, documentInfoResponseFor(info))
+}
+
+func (h *Handler) removeDocument(w http.ResponseWriter, r *http.Request) {
+	if err := h.store.RemoveDocument(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	h.logger.InfoContext(r.Context(), "document removed", "document_id", r.PathValue("id"))
+	writeJSON(w, http.StatusOK, healthResponse{OK: true})
 }
 
 func (h *Handler) search(w http.ResponseWriter, r *http.Request) {

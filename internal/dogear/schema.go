@@ -2,7 +2,7 @@ package dogear
 
 import "context"
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 func (s *Store) Init() error {
 	stmts := []string{
@@ -79,6 +79,17 @@ func (s *Store) Init() error {
 	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&version); err != nil {
 		return err
 	}
+	if version < 5 {
+		hasWarnings, err := s.hasColumn("documents", "import_warnings_json")
+		if err != nil {
+			return err
+		}
+		if !hasWarnings {
+			if _, err := s.db.Exec(`ALTER TABLE documents ADD COLUMN import_warnings_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+				return err
+			}
+		}
+	}
 	if version < schemaVersion {
 		if _, err := s.RebuildIndex(context.Background()); err != nil {
 			return err
@@ -91,6 +102,26 @@ func (s *Store) Init() error {
 		}
 	}
 	return s.verifyFTS5()
+}
+
+func (s *Store) hasColumn(table, column string) (bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) verifyFTS5() error {

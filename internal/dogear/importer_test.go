@@ -234,6 +234,76 @@ func TestImportMarkdownStoresEmbeddedImagesWithRetrievedChunk(t *testing.T) {
 	}
 }
 
+func TestImportMarkdownStoresWrappedEmbeddedImageWithSurroundingMarkup(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "dogear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	mid := len(testPNGBase64) / 2
+	content := []byte("# Image Manual\n\n## Diagram\n\nBefore <span>![Image](<data:image/png;base64," + testPNGBase64[:mid] + "\n  " + testPNGBase64[mid:] + "> \"Diagram\")</span> after.\n")
+	if _, err := ImportMarkdown(context.Background(), store, "manual.md", content, ImportMetadata{ID: "wrapped-image"}, false); err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := store.DocumentChunks(context.Background(), "wrapped-image", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 || len(chunks[0].Images) != 1 {
+		t.Fatalf("unexpected chunks: %#v", chunks)
+	}
+	if chunks[0].Images[0].Alt != "Image" || chunks[0].Images[0].MediaType != "image/png" {
+		t.Fatalf("unexpected image: %#v", chunks[0].Images[0])
+	}
+	if strings.Contains(chunks[0].Text, "data:image") || !strings.Contains(chunks[0].Text, "Before <span>") || !strings.Contains(chunks[0].Text, "</span> after.") {
+		t.Fatalf("embedded image was not removed cleanly: %q", chunks[0].Text)
+	}
+}
+
+func TestDocumentHealthRetainsAndReplacesImportWarnings(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "dogear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("# Manual\n\n## Setup\n\nUseful setup instructions.\n\n![](data:image/png;base64," + testPNGBase64 + ")\n\n![Vector](data:image/svg+xml;base64,PHN2Zy8+)\n")
+	result, err := ImportMarkdown(context.Background(), store, "manual.md", content, ImportMetadata{ID: "health-manual"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Images != 1 || len(result.Warnings) != 2 {
+		t.Fatalf("unexpected import result: %#v", result)
+	}
+	health, err := store.DocumentHealth(context.Background(), "health-manual", EmbeddingIndexStatus{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.ChunkCount != 1 || health.ImageCount != 1 || !health.FTS.Complete || len(health.Warnings) != 2 {
+		t.Fatalf("unexpected health: %#v", health)
+	}
+	if health.Vectors.Configured || health.Vectors.Complete {
+		t.Fatalf("unexpected vector health: %#v", health.Vectors)
+	}
+
+	replacement := []byte("# Manual\n\n## Setup\n\nReplacement instructions with no import warnings.\n")
+	if _, err := ImportMarkdown(context.Background(), store, "manual.md", replacement, ImportMetadata{ID: "health-manual"}, true); err != nil {
+		t.Fatal(err)
+	}
+	health, err = store.DocumentHealth(context.Background(), "health-manual", EmbeddingIndexStatus{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.ImageCount != 0 || len(health.Warnings) != 0 {
+		t.Fatalf("replacement retained stale health: %#v", health)
+	}
+}
+
 func TestInitMigratesExistingImageSearchIndex(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "dogear.db"))
 	if err != nil {
@@ -250,7 +320,7 @@ func TestInitMigratesExistingImageSearchIndex(t *testing.T) {
 	if _, err := store.db.Exec(`DELETE FROM chunks_fts;
 		INSERT INTO chunks_fts(chunk_id, document_id, title, brand, model, heading_path, text)
 		SELECT c.id, c.document_id, d.title, d.brand, d.model, c.heading_path, c.text FROM chunks c JOIN documents d ON d.id = c.document_id;
-		DELETE FROM schema_migrations WHERE version = 4;`); err != nil {
+		DELETE FROM schema_migrations WHERE version IN (4, 5);`); err != nil {
 		t.Fatal(err)
 	}
 	before, err := store.Search(context.Background(), SearchOptions{Query: "rare waveform diagram", Limit: 2})
@@ -325,6 +395,13 @@ func TestEmbeddingIndexAndHybridRetrieval(t *testing.T) {
 	}
 	if !status.Complete || status.Indexed != 2 {
 		t.Fatalf("unexpected status: %#v", status)
+	}
+	health, err := store.DocumentHealth(context.Background(), "manual", status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.Vectors.Complete || health.Vectors.Indexed != health.Vectors.Total || health.Vectors.Total != 2 {
+		t.Fatalf("unexpected document vector health: %#v", health.Vectors)
 	}
 	query := make([]float32, 32)
 	query[0] = 1

@@ -1,4 +1,4 @@
-import type { AskResult, DocumentChunk, DocumentInfo, EmbeddingIndexStatus, Settings } from "./types";
+import type { AskResult, DocumentChunk, DocumentHealth, DocumentImportWarning, DocumentInfo, EmbeddingIndexStatus, Settings } from "./types";
 
 async function json<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, options);
@@ -11,10 +11,24 @@ export function listDocuments(): Promise<DocumentInfo[]> {
   return json<DocumentInfo[]>("/api/documents");
 }
 
-export async function importMarkdown(file: File, replace: boolean): Promise<{ documents: number; chunks: number }> {
+export function removeDocument(documentId: string): Promise<{ ok: boolean }> {
+  return json(`/api/documents/${encodeURIComponent(documentId)}`, { method: "DELETE" });
+}
+
+export function documentHealth(documentId: string): Promise<DocumentHealth> {
+  return json(`/api/documents/${encodeURIComponent(documentId)}/health`);
+}
+
+export interface ImportMetadata { id: string; brand: string; model: string; tags: string; }
+
+export async function importMarkdown(file: File, replace: boolean, metadata: ImportMetadata): Promise<{ documents: number; chunks: number; images: number; warnings?: DocumentImportWarning[] }> {
   const form = new FormData();
   form.set("file", file);
   form.set("replace", String(replace));
+  form.set("id", metadata.id);
+  form.set("brand", metadata.brand);
+  form.set("model", metadata.model);
+  form.set("tags", metadata.tags);
   return json("/api/import", { method: "POST", body: form });
 }
 

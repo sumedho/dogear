@@ -31,6 +31,7 @@ func TestAPIEndpoints(t *testing.T) {
 		{name: "health", path: "/api/health"},
 		{name: "documents", path: "/api/documents"},
 		{name: "document", path: "/api/documents/test-synth"},
+		{name: "document health", path: "/api/documents/test-synth/health"},
 		{name: "search", path: "/api/search?q=local+control"},
 		{name: "context", path: "/api/context?q=local+control"},
 		{name: "document chunks", path: "/api/documents/test-synth/chunks"},
@@ -47,6 +48,20 @@ func TestAPIEndpoints(t *testing.T) {
 				t.Fatalf("content type = %q", contentType)
 			}
 		})
+	}
+}
+
+func TestRemoveDocument(t *testing.T) {
+	handler := New(Options{Store: testStore(t)})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/documents/test-synth", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"ok":true`) {
+		t.Fatalf("delete status=%d body=%s", response.Code, response.Body.String())
+	}
+	missing := httptest.NewRecorder()
+	handler.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/api/documents/test-synth", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("removed document status=%d body=%s", missing.Code, missing.Body.String())
 	}
 }
 

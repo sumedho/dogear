@@ -17,6 +17,10 @@ func (s *Store) UpsertDocumentWithImages(ctx context.Context, doc Document, chun
 	if err != nil {
 		return err
 	}
+	warnings, err := json.Marshal(doc.ImportWarnings)
+	if err != nil {
+		return err
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -42,9 +46,9 @@ func (s *Store) UpsertDocumentWithImages(ctx context.Context, doc Document, chun
 	}
 
 	timestamp := now()
-	_, err = tx.ExecContext(ctx, `INSERT INTO documents(id, title, brand, model, version, source_path, source_hash, tags_json, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		doc.ID, doc.Title, doc.Brand, doc.Model, doc.Version, doc.SourcePath, doc.SourceHash, string(tags), timestamp, timestamp)
+	_, err = tx.ExecContext(ctx, `INSERT INTO documents(id, title, brand, model, version, source_path, source_hash, tags_json, import_warnings_json, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		doc.ID, doc.Title, doc.Brand, doc.Model, doc.Version, doc.SourcePath, doc.SourceHash, string(tags), string(warnings), timestamp, timestamp)
 	if err != nil {
 		return err
 	}
@@ -79,7 +83,7 @@ func (s *Store) UpsertDocumentWithImages(ctx context.Context, doc Document, chun
 }
 
 func (s *Store) ListDocuments(ctx context.Context) ([]DocumentInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.title, d.brand, d.model, d.version, d.source_path, d.source_hash, d.tags_json,
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.title, d.brand, d.model, d.version, d.source_path, d.source_hash, d.tags_json, d.import_warnings_json,
 			d.created_at, d.updated_at,
 			COUNT(DISTINCT c.id) AS chunk_count,
 			COUNT(DISTINCT f.rowid) AS indexed_chunks,
@@ -97,7 +101,7 @@ func (s *Store) ListDocuments(ctx context.Context) ([]DocumentInfo, error) {
 }
 
 func (s *Store) DocumentInfo(ctx context.Context, id string) (DocumentInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.title, d.brand, d.model, d.version, d.source_path, d.source_hash, d.tags_json,
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.title, d.brand, d.model, d.version, d.source_path, d.source_hash, d.tags_json, d.import_warnings_json,
 			d.created_at, d.updated_at,
 			COUNT(DISTINCT c.id) AS chunk_count,
 			COUNT(DISTINCT f.rowid) AS indexed_chunks,
@@ -154,11 +158,15 @@ func scanDocumentInfos(rows *sql.Rows) ([]DocumentInfo, error) {
 	for rows.Next() {
 		var info DocumentInfo
 		var tagsJSON string
-		if err := rows.Scan(&info.ID, &info.Title, &info.Brand, &info.Model, &info.Version, &info.SourcePath, &info.SourceHash, &tagsJSON,
+		var warningsJSON string
+		if err := rows.Scan(&info.ID, &info.Title, &info.Brand, &info.Model, &info.Version, &info.SourcePath, &info.SourceHash, &tagsJSON, &warningsJSON,
 			&info.CreatedAt, &info.UpdatedAt, &info.ChunkCount, &info.IndexedChunks, &info.PageCount); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(tagsJSON), &info.Tags); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(warningsJSON), &info.ImportWarnings); err != nil {
 			return nil, err
 		}
 		infos = append(infos, info)

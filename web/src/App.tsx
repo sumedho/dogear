@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { buildEmbeddingIndex, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, saveSettings, streamAsk, testSettings } from "./api";
+import { buildEmbeddingIndex, documentHealth, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, removeDocument as removeDocumentAPI, saveSettings, streamAsk, testSettings } from "./api";
 import { loadChats, newChat, saveChats } from "./storage";
-import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentInfo, EmbeddingIndexStatus, Settings, SourceRef } from "./types";
+import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentHealth, DocumentInfo, EmbeddingIndexStatus, Settings, SourceRef } from "./types";
 
 function sourceDescription(source: SourceRef): string {
   const parts = [source.title];
@@ -11,6 +11,49 @@ function sourceDescription(source: SourceRef): string {
   if (source.heading_path) parts.push(source.heading_path);
   parts.push(`lines ${source.start_line}–${source.end_line}`);
   return parts.join(" · ");
+}
+
+type MarkdownNode = { type: string; value?: string; url?: string; children?: MarkdownNode[] };
+
+function remarkCitations() {
+  return (tree: MarkdownNode) => {
+    const visit = (node: MarkdownNode) => {
+      if (!node.children || node.type === "link") return;
+      for (let index = 0; index < node.children.length; index++) {
+        const child = node.children[index];
+        if (child.type !== "text" || !child.value) {
+          visit(child);
+          continue;
+        }
+        const parts: MarkdownNode[] = [];
+        let offset = 0;
+        for (const match of child.value.matchAll(/\[(\d+)\]/g)) {
+          if (match.index > offset) parts.push({ type: "text", value: child.value.slice(offset, match.index) });
+          parts.push({ type: "link", url: `citation:${match[1]}`, children: [{ type: "text", value: match[0] }] });
+          offset = match.index + match[0].length;
+        }
+        if (!parts.length) continue;
+        if (offset < child.value.length) parts.push({ type: "text", value: child.value.slice(offset) });
+        node.children.splice(index, 1, ...parts);
+        index += parts.length - 1;
+      }
+    };
+    visit(tree);
+  };
+}
+
+function AnswerMarkdown({ message, onOpen }: { message: ChatMessage; onOpen(documentId: string, chunkId?: number): void }) {
+  return <ReactMarkdown
+    remarkPlugins={[remarkGfm, remarkCitations]}
+    urlTransform={(url) => url.startsWith("citation:") ? url : defaultUrlTransform(url)}
+    components={{ a: ({ href, children }) => {
+      const label = href?.startsWith("citation:") ? `[${href.slice("citation:".length)}]` : "";
+      const source = message.sources?.find((candidate) => candidate.label === label);
+      if (source) return <button type="button" className="citation" title={sourceDescription(source)} onClick={() => onOpen(source.document_id, source.chunk_id)}>{children}</button>;
+      if (label) return <span className="citation citation-pending">{children}</span>;
+      return <a href={href}>{children}</a>;
+    } }}
+  >{message.content || (message.status === "streaming" ? "Searching the manual…" : "")}</ReactMarkdown>;
 }
 
 function initialChats(): Chat[] {
@@ -22,7 +65,10 @@ export default function App() {
   const [chats, setChats] = useState<Chat[]>(initialChats);
   const [activeId, setActiveId] = useState(() => chats[0].id);
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
-  const [draft, setDraft] = useState("");
+  const [editingChat, setEditingChat] = useState<{ id: string; title: string } | null>(null);
+  const [deleteChat, setDeleteChat] = useState<Chat | null>(null);
+  const [healthDocument, setHealthDocument] = useState<DocumentInfo | null>(null);
+  const [deleteDocument, setDeleteDocument] = useState<DocumentInfo | null>(null);
   const [browseOpen, setBrowseOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -32,6 +78,8 @@ export default function App() {
   const [docsError, setDocsError] = useState("");
   const [controller, setController] = useState<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const cancelRenameRef = useRef(false);
   const current = chats.find((chat) => chat.id === activeId) || chats[0];
 
   const refreshDocuments = async () => {
@@ -62,7 +110,6 @@ export default function App() {
     const chat = newChat();
     setChats((items) => [chat, ...items]);
     setActiveId(chat.id);
-    setDraft("");
     setSidebarOpen(false);
   };
 
@@ -82,8 +129,14 @@ export default function App() {
     updateChat(current.id, (chat) => ({ ...chat, documentId, updatedAt: Date.now() }));
   };
 
+  const renameChat = () => {
+    if (!editingChat?.title.trim()) { setEditingChat(null); return; }
+    updateChat(editingChat.id, (chat) => ({ ...chat, title: editingChat.title.trim(), updatedAt: Date.now() }));
+    setEditingChat(null);
+  };
+
   const send = async () => {
-    const question = draft.trim();
+    const question = current.draft.trim();
     if (!question || controller) return;
     const chat = current;
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: question, status: "done" };
@@ -95,10 +148,10 @@ export default function App() {
     updateChat(chat.id, (value) => ({
       ...value,
       title: value.messages.length ? value.title : question.slice(0, 48),
+      draft: "",
       messages: [...value.messages, userMessage, assistantMessage],
       updatedAt: Date.now(),
     }));
-    setDraft("");
     const abort = new AbortController();
     setController(abort);
     try {
@@ -142,6 +195,20 @@ export default function App() {
 
   const activeDocument = documents.find((document) => document.id === current.documentId);
 	const openViewer = (documentId: string, chunkId?: number) => { location.hash = `manual/${encodeURIComponent(documentId)}${chunkId ? `/chunk/${chunkId}` : ""}`; };
+  const closeViewer = () => { history.pushState(null, "", location.pathname + location.search); setViewer(null); };
+  const askAboutSection = (chunk: DocumentChunk) => {
+    const prefix = `In the “${chunk.heading_path || `Chunk ${chunk.ordinal}`}” section, `;
+    updateChat(current.id, (chat) => ({ ...chat, documentId: chunk.document_id, draft: prefix + chat.draft, updatedAt: Date.now() }));
+    closeViewer();
+    requestAnimationFrame(() => composerRef.current?.focus());
+  };
+  const removeManual = async (document: DocumentInfo) => {
+    await removeDocumentAPI(document.id);
+    setDocuments((items) => items.filter((item) => item.id !== document.id));
+    setChats((items) => items.map((chat) => chat.documentId === document.id ? { ...chat, documentId: "", updatedAt: Date.now() } : chat));
+    if (viewer?.documentId === document.id) closeViewer();
+    setDeleteDocument(null);
+  };
 
   return (
     <div className="app-shell">
@@ -161,8 +228,11 @@ export default function App() {
         <nav className="chat-list">
           {chats.map((chat) => (
             <div className={`chat-row ${chat.id === current.id ? "active" : ""}`} key={chat.id}>
-              <button className="chat-select" onClick={() => { setActiveId(chat.id); setSidebarOpen(false); }}>{chat.title}</button>
-              <button className="delete-chat" onClick={() => removeChat(chat.id)} aria-label={`Delete ${chat.title}`}>×</button>
+              {editingChat?.id === chat.id
+                ? <input className="chat-rename" autoFocus value={editingChat.title} onChange={(event) => setEditingChat({ id: chat.id, title: event.target.value })} onBlur={() => { if (!cancelRenameRef.current) renameChat(); cancelRenameRef.current = false; }} onKeyDown={(event) => { if (event.key === "Enter") renameChat(); if (event.key === "Escape") { cancelRenameRef.current = true; setEditingChat(null); } }} aria-label="Chat title" />
+                : <button className="chat-select" onClick={() => { setActiveId(chat.id); setSidebarOpen(false); }}>{chat.title}</button>}
+              <button className="chat-action" onClick={() => { cancelRenameRef.current = false; setEditingChat({ id: chat.id, title: chat.title }); }} aria-label={`Rename ${chat.title}`}>✎</button>
+              <button className="chat-action delete-chat" onClick={() => setDeleteChat(chat)} aria-label={`Delete ${chat.title}`}>×</button>
             </div>
           ))}
         </nav>
@@ -194,7 +264,7 @@ export default function App() {
               <div className="message-body">
                 <div className="message-author">{message.role === "user" ? "You" : "Dogear"}</div>
                 {message.role === "assistant" ? (
-                  <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content || (message.status === "streaming" ? "Searching the manual…" : "")}</ReactMarkdown></div>
+                  <div className="markdown"><AnswerMarkdown message={message} onOpen={openViewer} /></div>
                 ) : <div className="user-text">{message.content}</div>}
 				{message.images && message.images.length > 0 && <AnswerImages images={message.images} onOpen={openViewer} />}
                 {message.status === "streaming" && <span className="streaming-cursor" aria-label="Streaming" />}
@@ -209,8 +279,9 @@ export default function App() {
         <div className="composer-wrap">
           <div className="composer">
             <textarea
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
+              ref={composerRef}
+              value={current.draft}
+              onChange={(event) => updateChat(current.id, (chat) => ({ ...chat, draft: event.target.value, updatedAt: Date.now() }))}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
@@ -222,16 +293,19 @@ export default function App() {
               rows={1}
             />
             {controller ? <button className="send-button stop" onClick={() => controller.abort()} aria-label="Stop response">■</button>
-              : <button className="send-button" onClick={() => void send()} disabled={!draft.trim() || !documents.length} aria-label="Send message">↑</button>}
+              : <button className="send-button" onClick={() => void send()} disabled={!current.draft.trim() || !documents.length} aria-label="Send message">↑</button>}
           </div>
           <div className="composer-note">Answers are grounded in retrieved manual sections. Verify important details against the cited sources.</div>
         </div>
       </main>
 
-      {browseOpen && <ManualDialog documents={documents} loading={loadingDocs} error={docsError} onRefresh={refreshDocuments} onSelect={(id) => { selectDocument(id); setBrowseOpen(false); }} onOpen={(id) => { setBrowseOpen(false); openViewer(id); }} onClose={() => setBrowseOpen(false)} />}
+      {browseOpen && <ManualDialog documents={documents} loading={loadingDocs} error={docsError} onRefresh={refreshDocuments} onSelect={(id) => { selectDocument(id); setBrowseOpen(false); }} onOpen={(id) => { setBrowseOpen(false); openViewer(id); }} onHealth={(document) => { setBrowseOpen(false); setHealthDocument(document); }} onRemove={(document) => { setBrowseOpen(false); setDeleteDocument(document); }} onClose={() => setBrowseOpen(false)} />}
       {importOpen && <ImportDialog onClose={() => setImportOpen(false)} onImported={refreshDocuments} />}
 		{settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
-		{viewer && <ManualViewer manual={documents.find((item) => item.id === viewer.documentId)} documentId={viewer.documentId} chunkId={viewer.chunkId} onClose={() => { history.pushState(null, "", location.pathname + location.search); setViewer(null); }} />}
+		{viewer && <ManualViewer manual={documents.find((item) => item.id === viewer.documentId)} documentId={viewer.documentId} chunkId={viewer.chunkId} onAsk={askAboutSection} onClose={closeViewer} />}
+      {deleteChat && <ConfirmDeleteChat chat={deleteChat} streaming={deleteChat.messages.some((message) => message.status === "streaming")} onCancel={() => setDeleteChat(null)} onConfirm={() => { if (deleteChat.messages.some((message) => message.status === "streaming")) controller?.abort(); removeChat(deleteChat.id); setDeleteChat(null); }} />}
+      {healthDocument && <DocumentHealthDialog document={healthDocument} onClose={() => setHealthDocument(null)} onSettings={() => { setHealthDocument(null); setSettingsOpen(true); }} />}
+      {deleteDocument && <ConfirmDeleteDocument document={deleteDocument} onCancel={() => setDeleteDocument(null)} onConfirm={() => removeManual(deleteDocument)} />}
       {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar" />}
     </div>
   );
@@ -251,7 +325,7 @@ function AnswerImages({ images, onOpen }: { images: DisplayImage[]; onOpen(docum
 function SourceCards({ message, onOpen }: { message: ChatMessage; onOpen(documentId: string, chunkId?: number): void }) {
   const blocks = message.retrieval?.blocks || [];
   return (
-    <details className="sources" open>
+    <details className="sources">
       <summary>{message.sources?.length} sources</summary>
       <div className="source-grid">
         {message.sources?.map((source) => {
@@ -269,8 +343,8 @@ function SourceCards({ message, onOpen }: { message: ChatMessage; onOpen(documen
   );
 }
 
-function ManualDialog({ documents, loading, error, onRefresh, onSelect, onOpen, onClose }: {
-  documents: DocumentInfo[]; loading: boolean; error: string; onRefresh(): Promise<void>; onSelect(id: string): void; onOpen(id: string): void; onClose(): void;
+function ManualDialog({ documents, loading, error, onRefresh, onSelect, onOpen, onHealth, onRemove, onClose }: {
+  documents: DocumentInfo[]; loading: boolean; error: string; onRefresh(): Promise<void>; onSelect(id: string): void; onOpen(id: string): void; onHealth(document: DocumentInfo): void; onRemove(document: DocumentInfo): void; onClose(): void;
 }) {
   return <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-label="Manual library">
     <div className="modal-header"><div><h2>Manual library</h2><p>Select the manual used by the current chat.</p></div><button className="icon-button" onClick={onClose}>×</button></div>
@@ -279,36 +353,87 @@ function ManualDialog({ documents, loading, error, onRefresh, onSelect, onOpen, 
     {!loading && !error && <div className="manual-list">
       <button className="manual-item" onClick={() => onSelect("")}><strong>All manuals</strong><span>Search every imported document</span></button>
       {documents.map((document) => <div className="manual-item" key={document.id}>
-        <strong>{document.title}</strong><span>{[document.brand, document.model].filter(Boolean).join(" ") || document.id} · {document.chunk_count} chunks · {document.page_count} pages</span>
-		<div><button onClick={() => onSelect(document.id)}>Use in chat</button><button onClick={() => onOpen(document.id)}>Open manual</button></div>
+		<strong>{document.title}</strong><div className="manual-metadata"><span><b>ID</b> {document.id}</span>{document.brand && <span><b>Brand</b> {document.brand}</span>}{document.model && <span><b>Model</b> {document.model}</span>}{document.tags.length > 0 && <span><b>Tags</b> {document.tags.join(", ")}</span>}</div><span>{document.chunk_count} chunks · {document.page_count} pages</span>
+		<div className="manual-actions"><button onClick={() => onSelect(document.id)}>Use in chat</button><button onClick={() => onOpen(document.id)}>Open manual</button><button onClick={() => onHealth(document)}>Health</button><button className="remove-manual" onClick={() => onRemove(document)}>Remove</button></div>
       </div>)}
     </div>}
   </div></div>;
 }
 
-function ManualViewer({ manual, documentId, chunkId, onClose }: { manual?: DocumentInfo; documentId: string; chunkId?: number; onClose(): void }) {
+function ManualViewer({ manual, documentId, chunkId, onAsk, onClose }: { manual?: DocumentInfo; documentId: string; chunkId?: number; onAsk(chunk: DocumentChunk): void; onClose(): void }) {
   const [chunks, setChunks] = useState<DocumentChunk[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState("");
+  const loadingMoreRef = useRef(false);
   useEffect(() => {
-    let active = true; setLoading(true);
+    let active = true; setLoading(true); setHasMore(true); setError(""); loadingMoreRef.current = false;
     loadDocumentChunks(documentId, chunkId).then((page) => {
-	  if (!active) return; setChunks(page); setLoading(false);
+      if (!active) return; setChunks(page); setLoading(false); setHasMore(page.length === 50);
       setTimeout(() => document.getElementById(`chunk-${chunkId}`)?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
     }).catch((reason) => { if (active) { setError(reason instanceof Error ? reason.message : "Could not load manual"); setLoading(false); } });
     return () => { active = false; };
   }, [documentId, chunkId]);
-  const loadMore = async () => { const last = chunks.reduce((max, item) => Math.max(max, item.ordinal), 0); const next = await listDocumentChunks(documentId, last); setChunks((items) => [...items, ...next.filter((candidate) => !items.some((item) => item.id === candidate.id))]); };
+  const loadMore = async () => {
+    if (!hasMore || loadingMoreRef.current) return;
+    loadingMoreRef.current = true; setLoadingMore(true);
+    try {
+      const last = chunks.reduce((max, item) => Math.max(max, item.ordinal), 0);
+      const next = await listDocumentChunks(documentId, last);
+      setChunks((items) => [...items, ...next.filter((candidate) => !items.some((item) => item.id === candidate.id))]);
+      setHasMore(next.length === 50);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not load more sections");
+    } finally {
+      loadingMoreRef.current = false; setLoadingMore(false);
+    }
+  };
+  const loadNearEnd = (element: HTMLElement) => { if (element.scrollHeight - element.scrollTop - element.clientHeight < 160) void loadMore(); };
   return <div className="viewer-backdrop"><section className="manual-viewer" role="dialog" aria-modal="true">
-    <header><div><h2>{manual?.title || documentId}</h2><span>{manual?.brand} {manual?.model}</span></div><button className="icon-button" onClick={onClose}>×</button></header>
-    <div className="viewer-layout"><nav>{chunks.map((chunk) => <a key={chunk.id} href={`#manual/${encodeURIComponent(documentId)}/chunk/${chunk.id}`}>{chunk.heading_path || `Chunk ${chunk.ordinal}`}</a>)}</nav>
-      <main>{loading && <p>Loading manual…</p>}{error && <div className="message-error">{error}</div>}{chunks.map((chunk) => <article id={`chunk-${chunk.id}`} className={chunk.id === chunkId ? "target-chunk" : ""} key={chunk.id}>
-        <h3>{chunk.heading_path}</h3><div className="chunk-meta">{chunk.page_number ? `Page ${chunk.page_number} · ` : ""}lines {chunk.start_line}–{chunk.end_line}</div>
+    <header><div><h2>{manual?.title || documentId}</h2><span>{[manual?.id || documentId, manual?.brand, manual?.model, ...(manual?.tags || [])].filter(Boolean).join(" · ")}</span></div><button className="icon-button" onClick={onClose}>×</button></header>
+    <div className="viewer-layout"><nav onScroll={(event) => loadNearEnd(event.currentTarget)}>{chunks.map((chunk) => <a key={chunk.id} href={`#manual/${encodeURIComponent(documentId)}/chunk/${chunk.id}`}>{chunk.heading_path || `Chunk ${chunk.ordinal}`}</a>)}{hasMore && <button className="toc-load-more" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading sections…" : "Load more sections"}</button>}</nav>
+      <main onScroll={(event) => loadNearEnd(event.currentTarget)}>{loading && <p>Loading manual…</p>}{error && <div className="message-error">{error}</div>}{chunks.map((chunk) => <article id={`chunk-${chunk.id}`} className={chunk.id === chunkId ? "target-chunk" : ""} key={chunk.id}>
+        <div className="chunk-heading"><div><h3>{chunk.heading_path}</h3><div className="chunk-meta">{chunk.page_number ? `Page ${chunk.page_number} · ` : ""}lines {chunk.start_line}–{chunk.end_line}</div></div><button onClick={() => onAsk(chunk)}>Ask about this section</button></div>
         <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{chunk.text}</ReactMarkdown></div>
         {chunk.images?.map((image) => <img key={image.id} src={`/api/images/${image.id}`} alt={image.alt} loading="lazy" />)}
-      </article>)}{chunks.length > 0 && <button className="load-more" onClick={() => void loadMore()}>Load more</button>}</main>
+      </article>)}{hasMore && <button className="load-more" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more"}</button>}</main>
     </div>
   </section></div>;
+}
+
+function ConfirmDeleteChat({ chat, streaming, onCancel, onConfirm }: { chat: Chat; streaming: boolean; onCancel(): void; onConfirm(): void }) {
+  useEffect(() => { const cancel = (event: KeyboardEvent) => { if (event.key === "Escape") onCancel(); }; window.addEventListener("keydown", cancel); return () => window.removeEventListener("keydown", cancel); }, [onCancel]);
+  return <div className="modal-backdrop"><div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-chat-title">
+    <h2 id="delete-chat-title">Delete chat?</h2><p>“{chat.title}” and its messages will be permanently removed.{streaming ? " The active response will be stopped." : ""}</p>
+    <div className="confirm-actions"><button onClick={onCancel} autoFocus>Cancel</button><button className="danger-button" onClick={onConfirm}>Delete</button></div>
+  </div></div>;
+}
+
+function ConfirmDeleteDocument({ document, onCancel, onConfirm }: { document: DocumentInfo; onCancel(): void; onConfirm(): Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { const cancel = (event: KeyboardEvent) => { if (event.key === "Escape" && !busy) onCancel(); }; window.addEventListener("keydown", cancel); return () => window.removeEventListener("keydown", cancel); }, [busy, onCancel]);
+  const remove = async () => { setBusy(true); setError(""); try { await onConfirm(); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not remove manual"); setBusy(false); } };
+  return <div className="modal-backdrop"><div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-document-title">
+    <h2 id="delete-document-title">Remove manual?</h2><p>“{document.title}” and its indexed chunks and images will be permanently removed. Existing chats will switch to all manuals.</p>
+    {error && <div className="message-error">{error}</div>}<div className="confirm-actions"><button onClick={onCancel} disabled={busy} autoFocus>Cancel</button><button className="danger-button" onClick={() => void remove()} disabled={busy}>{busy ? "Removing…" : "Remove"}</button></div>
+  </div></div>;
+}
+
+function DocumentHealthDialog({ document, onClose, onSettings }: { document: DocumentInfo; onClose(): void; onSettings(): void }) {
+  const [health, setHealth] = useState<DocumentHealth | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => { let active = true; documentHealth(document.id).then((value) => { if (active) setHealth(value); }).catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Could not load document health"); }); return () => { active = false; }; }, [document.id]);
+  const state = (coverage: { complete: boolean; total: number }) => coverage.total === 0 ? "Empty" : coverage.complete ? "Healthy" : "Incomplete";
+  return <div className="modal-backdrop"><div className="modal health-dialog" role="dialog" aria-modal="true" aria-labelledby="health-title">
+    <div className="modal-header"><div><h2 id="health-title">Document health</h2><p>{document.title}</p></div><button className="icon-button" onClick={onClose}>×</button></div>
+    {!health && !error && <div className="modal-status">Checking document…</div>}{error && <div className="message-error">{error}</div>}
+    {health && <><div className="health-counts"><div><strong>{health.chunk_count}</strong><span>Chunks</span></div><div><strong>{health.image_count}</strong><span>Images</span></div></div>
+      <div className="health-index"><div><strong>Full-text index</strong><span>{state(health.fts)} · {health.fts.indexed}/{health.fts.total} chunks</span></div><div><strong>Vector index</strong><span>{!health.vectors.configured ? "Not configured" : health.vectors.stale ? `Stale · ${health.vectors.indexed}/${health.vectors.total} chunks` : `${state(health.vectors)} · ${health.vectors.indexed}/${health.vectors.total} chunks`}</span></div></div>
+      <section className="health-warnings"><h3>Import warnings</h3>{health.warnings.length ? <ul>{health.warnings.map((warning, index) => <li key={`${warning.code}-${warning.line || 0}-${index}`}>{warning.line ? `Line ${warning.line}: ` : ""}{warning.message}</li>)}</ul> : <p>No import warnings.</p>}</section>
+      <div className="modal-footer"><button className="secondary-button" onClick={onSettings}>Open settings</button><button onClick={onClose}>Done</button></div></>}
+  </div></div>;
 }
 
 function SettingsDialog({ onClose }: { onClose(): void }) {
@@ -335,36 +460,76 @@ function KeyFields({ settings, change }: { settings: { api_key?: string; api_key
   return <div className="key-fields"><label>API key action<select value={settings.api_key_action || "preserve"} onChange={(event) => change("api_key_action", event.target.value)}><option value="preserve">Preserve {settings.api_key_set ? "saved key" : "empty key"}</option><option value="replace">Replace key</option><option value="clear">Clear key</option></select></label>{settings.api_key_action === "replace" && <label>New API key<input type="password" value={settings.api_key || ""} onChange={(event) => change("api_key", event.target.value)} /></label>}</div>;
 }
 
+type ImportFileStatus = { state: "ready" | "importing" | "success" | "error"; detail: string };
+const importFileKey = (file: File) => `${file.name}-${file.size}-${file.lastModified}`;
+
 function ImportDialog({ onClose, onImported }: { onClose(): void; onImported(): Promise<void> }) {
   const [files, setFiles] = useState<File[]>([]);
+  const [dragging, setDragging] = useState(false);
   const [replace, setReplace] = useState(false);
-  const [statuses, setStatuses] = useState<Record<string, string>>({});
+  const [metadata, setMetadata] = useState({ id: "", brand: "", model: "", tags: "" });
+  const [statuses, setStatuses] = useState<Record<string, ImportFileStatus>>({});
+  const [selectionError, setSelectionError] = useState("");
   const [busy, setBusy] = useState(false);
   const totalSize = useMemo(() => files.reduce((sum, file) => sum + file.size, 0), [files]);
+  const completed = files.filter((file) => ["success", "error"].includes(statuses[importFileKey(file)]?.state)).length;
+  const failed = files.filter((file) => statuses[importFileKey(file)]?.state === "error").length;
+  const succeeded = files.filter((file) => statuses[importFileKey(file)]?.state === "success").length;
+  const selectFiles = (selected: File[]) => {
+    const markdown = selected.filter((file) => /\.(?:md|markdown)$/i.test(file.name) || file.type === "text/markdown");
+    setFiles(markdown);
+    setStatuses(Object.fromEntries(markdown.map((file) => [importFileKey(file), { state: "ready", detail: "Ready" }])));
+    setSelectionError(markdown.length === selected.length ? "" : "Only Markdown files can be imported.");
+  };
 
   const runImport = async () => {
     setBusy(true);
-    for (const file of files) {
-      setStatuses((value) => ({ ...value, [file.name]: "Importing…" }));
+    const pending = files.filter((file) => statuses[importFileKey(file)]?.state !== "success");
+    for (let index = 0; index < pending.length; index++) {
+      const file = pending[index];
+      const key = importFileKey(file);
+      setStatuses((value) => ({ ...value, [key]: { state: "importing", detail: `Importing ${index + 1} of ${pending.length}…` } }));
       try {
-        const result = await importMarkdown(file, replace);
-        setStatuses((value) => ({ ...value, [file.name]: `Imported ${result.chunks} chunks` }));
+        const result = await importMarkdown(file, replace, { ...metadata, id: files.length === 1 ? metadata.id.trim() : "", brand: metadata.brand.trim(), model: metadata.model.trim(), tags: metadata.tags.trim() });
+        const imageDetail = result.images === 1 ? "1 image" : `${result.images} images`;
+        const warningDetail = result.warnings?.length ? ` · ${result.warnings.length} warning${result.warnings.length === 1 ? "" : "s"}` : "";
+        setStatuses((value) => ({ ...value, [key]: { state: "success", detail: `${result.chunks} chunks · ${imageDetail}${warningDetail}` } }));
       } catch (error) {
-        setStatuses((value) => ({ ...value, [file.name]: error instanceof Error ? error.message : "Import failed" }));
+        setStatuses((value) => ({ ...value, [key]: { state: "error", detail: error instanceof Error ? error.message : "Import failed" } }));
       }
     }
-    await onImported();
-    setBusy(false);
+    try {
+      await onImported();
+    } catch (error) {
+      setSelectionError(error instanceof Error ? `Files imported, but the manual list could not refresh: ${error.message}` : "Files imported, but the manual list could not refresh.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   return <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-label="Import Markdown">
-    <div className="modal-header"><div><h2>Import Markdown</h2><p>Embedded PNG, JPEG, GIF, and WebP images are stored with their source sections.</p></div><button className="icon-button" onClick={onClose}>×</button></div>
-    <label className="file-drop">
-      <input type="file" accept=".md,.markdown,text/markdown" multiple onChange={(event) => setFiles(Array.from(event.target.files || []))} />
-      <strong>Choose Markdown files</strong><span>Up to 100 MiB per upload</span>
+    <div className="modal-header"><div><h2>Import Markdown</h2><p>Embedded PNG, JPEG, GIF, and WebP images are stored with their source sections.</p></div><button className="icon-button" onClick={onClose} disabled={busy}>×</button></div>
+    <div className="import-metadata">
+      <label>Document ID<input value={metadata.id} disabled={busy || files.length > 1} placeholder="Generated from title when empty" onChange={(event) => setMetadata({ ...metadata, id: event.target.value })} /><small>{files.length > 1 ? "A custom ID can only be used when importing one file." : "Stable identifier used by links and replacement imports."}</small></label>
+      <label>Brand<input value={metadata.brand} disabled={busy} placeholder="e.g. Elektron" onChange={(event) => setMetadata({ ...metadata, brand: event.target.value })} /></label>
+      <label>Model<input value={metadata.model} disabled={busy} placeholder="e.g. Analog Four MKII" onChange={(event) => setMetadata({ ...metadata, model: event.target.value })} /></label>
+      <label>Tags<input value={metadata.tags} disabled={busy} placeholder="synthesizer, reference, studio" onChange={(event) => setMetadata({ ...metadata, tags: event.target.value })} /><small>Separate tags with commas.</small></label>
+    </div>
+    <label className={`file-drop${dragging ? " dragging" : ""}`}
+      onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+      onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; setDragging(true); }}
+      onDragLeave={(event) => { event.preventDefault(); if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
+      onDrop={(event) => { event.preventDefault(); event.stopPropagation(); setDragging(false); selectFiles(Array.from(event.dataTransfer.files)); }}>
+      <input type="file" accept=".md,.markdown,text/markdown" multiple onChange={(event) => selectFiles(Array.from(event.target.files || []))} />
+      <strong>{dragging ? "Drop Markdown files here" : "Choose or drop Markdown files"}</strong><span>Up to 100 MiB per upload</span>
     </label>
-    {files.length > 0 && <div className="import-list">{files.map((file) => <div key={`${file.name}-${file.size}`}><span>{file.name} <small>{(file.size / 1024).toFixed(1)} KiB</small></span><span>{statuses[file.name] || "Ready"}</span></div>)}</div>}
+    {selectionError && <div className="message-error">{selectionError}</div>}
+    {files.length > 0 && <><div className="import-progress"><progress max={files.length} value={completed} /><span>{busy ? `${completed} of ${files.length} complete` : completed === files.length ? `${succeeded} imported${failed ? ` · ${failed} failed` : ""}` : `${files.length} selected`}</span></div>
+      <div className="import-list">{files.map((file) => {
+        const status = statuses[importFileKey(file)] || { state: "ready", detail: "Ready" };
+        return <div className={`import-${status.state}`} key={importFileKey(file)}><span><strong>{file.name}</strong> <small>{(file.size / 1024).toFixed(1)} KiB</small></span><span className="import-detail">{status.state === "success" ? "✓ " : status.state === "error" ? "! " : ""}{status.detail}</span></div>;
+      })}</div></>}
     <label className="checkbox"><input type="checkbox" checked={replace} onChange={(event) => setReplace(event.target.checked)} /> Replace manuals with matching IDs</label>
-    <div className="modal-footer"><span>{files.length ? `${files.length} file${files.length > 1 ? "s" : ""} · ${(totalSize / 1024 / 1024).toFixed(1)} MiB` : "No files selected"}</span><button onClick={() => void runImport()} disabled={!files.length || busy}>{busy ? "Importing…" : "Import"}</button></div>
+    <div className="modal-footer"><span>{files.length ? `${files.length} file${files.length > 1 ? "s" : ""} · ${(totalSize / 1024 / 1024).toFixed(1)} MiB` : "No files selected"}</span><button onClick={() => void runImport()} disabled={!files.length || busy || (completed === files.length && failed === 0)}>{busy ? "Importing…" : failed ? "Retry failed" : completed === files.length ? "Imported" : "Import"}</button></div>
   </div></div>;
 }

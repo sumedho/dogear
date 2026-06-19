@@ -5,14 +5,44 @@ import (
 )
 
 type Document struct {
-	ID         string
-	Title      string
-	Brand      string
-	Model      string
-	Version    string
-	SourcePath string
-	SourceHash string
-	Tags       []string
+	ID             string
+	Title          string
+	Brand          string
+	Model          string
+	Version        string
+	SourcePath     string
+	SourceHash     string
+	Tags           []string
+	ImportWarnings []DocumentImportWarning
+}
+
+type DocumentImportWarning struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Line    int    `json:"line,omitempty"`
+}
+
+type IndexCoverage struct {
+	Indexed  int  `json:"indexed"`
+	Total    int  `json:"total"`
+	Complete bool `json:"complete"`
+}
+
+type VectorCoverage struct {
+	IndexCoverage
+	Configured bool   `json:"configured"`
+	Stale      bool   `json:"stale"`
+	Model      string `json:"model,omitempty"`
+	UpdatedAt  string `json:"updated_at,omitempty"`
+}
+
+type DocumentHealth struct {
+	DocumentID string                  `json:"document_id"`
+	ChunkCount int                     `json:"chunk_count"`
+	ImageCount int                     `json:"image_count"`
+	FTS        IndexCoverage           `json:"fts"`
+	Vectors    VectorCoverage          `json:"vectors"`
+	Warnings   []DocumentImportWarning `json:"warnings"`
 }
 
 type DocumentInfo struct {

@@ -69,9 +69,22 @@ export interface Chat {
   id: string;
   title: string;
   documentId: string;
+  draft: string;
   messages: ChatMessage[];
   createdAt: number;
   updatedAt: number;
+}
+
+export interface DocumentImportWarning { code: string; message: string; line?: number; }
+export interface IndexCoverage { indexed: number; total: number; complete: boolean; }
+export interface VectorCoverage extends IndexCoverage { configured: boolean; stale: boolean; model?: string; updated_at?: string; }
+export interface DocumentHealth {
+  document_id: string;
+  chunk_count: number;
+  image_count: number;
+  fts: IndexCoverage;
+  vectors: VectorCoverage;
+  warnings: DocumentImportWarning[];
 }
 
 export interface DocumentChunk {

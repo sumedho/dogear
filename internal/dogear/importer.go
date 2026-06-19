@@ -28,8 +28,10 @@ type ImportMetadata struct {
 }
 
 type ImportResult struct {
-	Documents int `json:"documents"`
-	Chunks    int `json:"chunks"`
+	Documents int                     `json:"documents"`
+	Chunks    int                     `json:"chunks"`
+	Images    int                     `json:"images"`
+	Warnings  []DocumentImportWarning `json:"warnings,omitempty"`
 }
 
 const maxEmbeddedImageBytes = 25 << 20
@@ -65,10 +67,11 @@ type section struct {
 }
 
 var (
-	headingRE       = regexp.MustCompile(`^(#{1,6})\s+(.+?)\s*$`)
-	tocRowRE        = regexp.MustCompile(`^\|(.+?)\|\s*\.?\s*\.?\s*([0-9]{1,4})\s*\|`)
-	pageMarkerRE    = regexp.MustCompile(`(?i)^<!--\s*(?:dogear:page=|page:\s*)([0-9]{1,5})\s*-->$`)
-	embeddedImageRE = regexp.MustCompile(`^!\[([^]]*)\]\(data:(image/(?:png|jpeg|gif|webp));base64,([^)]*)\)\s*$`)
+	headingRE          = regexp.MustCompile(`^(#{1,6})\s+(.+?)\s*$`)
+	tocRowRE           = regexp.MustCompile(`^\|(.+?)\|\s*\.?\s*\.?\s*([0-9]{1,4})\s*\|`)
+	pageMarkerRE       = regexp.MustCompile(`(?i)^<!--\s*(?:dogear:page=|page:\s*)([0-9]{1,5})\s*-->$`)
+	embeddedImageRE    = regexp.MustCompile(`(?is)!\[([^]]*)\]\(\s*<?data:(image/(?:png|jpe?g|gif|webp));base64,([a-z0-9+/=\r\n\t ]+)>?(?:\s+["'][^"']*["'])?\s*\)`)
+	anyEmbeddedImageRE = regexp.MustCompile(`(?is)!\[([^]]*)\]\(\s*<?data:(image/[a-z0-9.+-]+);base64,([a-z0-9+/=\r\n\t ]+)>?(?:\s+["'][^"']*["'])?\s*\)`)
 )
 
 func ImportPath(ctx context.Context, store *Store, path string, meta ImportMetadata, replace bool) (ImportResult, error) {
@@ -98,6 +101,8 @@ func ImportPath(ctx context.Context, store *Store, path string, meta ImportMetad
 		}
 		result.Documents++
 		result.Chunks += len(chunks)
+		result.Images += len(images)
+		result.Warnings = append(result.Warnings, doc.ImportWarnings...)
 	}
 	if _, err := store.RebuildIndex(ctx); err != nil {
 		return ImportResult{}, err
@@ -119,7 +124,7 @@ func ImportMarkdown(ctx context.Context, store *Store, sourceName string, conten
 	if _, err := store.RebuildIndex(ctx); err != nil {
 		return ImportResult{}, err
 	}
-	return ImportResult{Documents: 1, Chunks: len(chunks)}, nil
+	return ImportResult{Documents: 1, Chunks: len(chunks), Images: len(images), Warnings: doc.ImportWarnings}, nil
 }
 
 func markdownFiles(path string) ([]string, error) {
@@ -167,7 +172,7 @@ func parseMarkdownFile(path string, meta ImportMetadata) (Document, []Chunk, err
 
 func parseMarkdown(path string, raw []byte, meta ImportMetadata) (Document, []Chunk, []DocumentImage, error) {
 	lines := scanLines(string(raw))
-	cleanedLines, embedded, err := extractEmbeddedImages(lines)
+	cleanedLines, embedded, warnings, err := extractEmbeddedImages(lines)
 	if err != nil {
 		return Document{}, nil, nil, err
 	}
@@ -189,21 +194,26 @@ func parseMarkdown(path string, raw []byte, meta ImportMetadata) (Document, []Ch
 	}
 
 	doc := Document{
-		ID:         docID,
-		Title:      title,
-		Brand:      meta.Brand,
-		Model:      meta.Model,
-		Version:    meta.Version,
-		SourcePath: path,
-		SourceHash: hashString(string(raw)),
-		Tags:       cleanTags(meta.Tags),
+		ID:             docID,
+		Title:          title,
+		Brand:          meta.Brand,
+		Model:          meta.Model,
+		Version:        meta.Version,
+		SourcePath:     path,
+		SourceHash:     hashString(string(raw)),
+		Tags:           cleanTags(meta.Tags),
+		ImportWarnings: warnings,
 	}
 	inferBrandModel(&doc)
 
 	pageMap := parseTOCPages(lines)
 	sections := splitSections(lines, pageMap)
 	chunks := chunksFromSections(doc.ID, sections)
-	images := attachImagesToChunks(doc.ID, embedded, sections, chunks)
+	images, attachmentWarnings := attachImagesToChunks(doc.ID, embedded, sections, chunks)
+	doc.ImportWarnings = append(doc.ImportWarnings, attachmentWarnings...)
+	if len(chunks) == 0 {
+		doc.ImportWarnings = append(doc.ImportWarnings, DocumentImportWarning{Code: "no_content_chunks", Message: "The import produced no searchable content chunks."})
+	}
 	return doc, chunks, images, nil
 }
 
@@ -430,37 +440,70 @@ func paragraphs(lines []string, lineNumbers []int) []paragraph {
 	return result
 }
 
-func extractEmbeddedImages(lines []string) ([]string, []embeddedImage, error) {
-	cleaned := append([]string(nil), lines...)
+func extractEmbeddedImages(lines []string) ([]string, []embeddedImage, []DocumentImportWarning, error) {
+	content := strings.Join(lines, "\n")
 	var images []embeddedImage
-	for i, line := range lines {
-		match := embeddedImageRE.FindStringSubmatch(strings.TrimSpace(line))
-		if match == nil {
+	var warnings []DocumentImportWarning
+	cleaned := embeddedImageRE.ReplaceAllStringFunc(content, func(matchText string) string {
+		// Keep line breaks so section and chunk source line numbers remain stable.
+		return strings.Map(func(r rune) rune {
+			if r == '\n' || r == '\r' {
+				return r
+			}
+			return ' '
+		}, matchText)
+	})
+	for _, indexes := range anyEmbeddedImageRE.FindAllStringSubmatchIndex(content, -1) {
+		mediaType := strings.ToLower(content[indexes[4]:indexes[5]])
+		if mediaType == "image/png" || mediaType == "image/jpeg" || mediaType == "image/jpg" || mediaType == "image/gif" || mediaType == "image/webp" {
 			continue
 		}
-		data, err := base64.StdEncoding.DecodeString(match[3])
+		line := strings.Count(content[:indexes[0]], "\n") + 1
+		warnings = append(warnings, DocumentImportWarning{Code: "unsupported_image", Message: fmt.Sprintf("An embedded %s image was skipped because its format is unsupported.", mediaType), Line: line})
+	}
+	cleaned = anyEmbeddedImageRE.ReplaceAllStringFunc(cleaned, func(matchText string) string {
+		return strings.Map(func(r rune) rune {
+			if r == '\n' || r == '\r' {
+				return r
+			}
+			return ' '
+		}, matchText)
+	})
+	for _, indexes := range embeddedImageRE.FindAllStringSubmatchIndex(content, -1) {
+		line := strings.Count(content[:indexes[0]], "\n") + 1
+		payload := strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) {
+				return -1
+			}
+			return r
+		}, content[indexes[6]:indexes[7]])
+		data, err := base64.StdEncoding.DecodeString(payload)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid embedded image on line %d: %w", i+1, err)
+			return nil, nil, nil, fmt.Errorf("invalid embedded image on line %d: %w", line, err)
 		}
 		if len(data) > maxEmbeddedImageBytes {
-			return nil, nil, fmt.Errorf("embedded image on line %d exceeds %d bytes", i+1, maxEmbeddedImageBytes)
+			return nil, nil, nil, fmt.Errorf("embedded image on line %d exceeds %d bytes", line, maxEmbeddedImageBytes)
 		}
-		mediaType := strings.ToLower(match[2])
+		mediaType := strings.ToLower(content[indexes[4]:indexes[5]])
+		if mediaType == "image/jpg" {
+			mediaType = "image/jpeg"
+		}
 		if detected := http.DetectContentType(data); detected != mediaType {
-			return nil, nil, fmt.Errorf("embedded image on line %d declares %s but contains %s", i+1, mediaType, detected)
+			return nil, nil, nil, fmt.Errorf("embedded image on line %d declares %s but contains %s", line, mediaType, detected)
 		}
-		alt := strings.TrimSpace(match[1])
+		alt := strings.TrimSpace(content[indexes[2]:indexes[3]])
 		if alt == "" {
 			alt = "Manual image"
+			warnings = append(warnings, DocumentImportWarning{Code: "missing_image_alt", Message: "An embedded image had no alternative text; the fallback “Manual image” was used.", Line: line})
 		}
-		images = append(images, embeddedImage{line: i + 1, alt: alt, mediaType: mediaType, data: data})
-		cleaned[i] = ""
+		images = append(images, embeddedImage{line: line, alt: alt, mediaType: mediaType, data: data})
 	}
-	return cleaned, images, nil
+	return strings.Split(cleaned, "\n"), images, warnings, nil
 }
 
-func attachImagesToChunks(documentID string, embedded []embeddedImage, sections []section, chunks []Chunk) []DocumentImage {
+func attachImagesToChunks(documentID string, embedded []embeddedImage, sections []section, chunks []Chunk) ([]DocumentImage, []DocumentImportWarning) {
 	images := make([]DocumentImage, 0, len(embedded))
+	var warnings []DocumentImportWarning
 	for i, image := range embedded {
 		var sectionPath string
 		for _, sec := range sections {
@@ -488,6 +531,7 @@ func attachImagesToChunks(documentID string, embedded []embeddedImage, sections 
 			}
 		}
 		if bestOrdinal == 0 {
+			warnings = append(warnings, DocumentImportWarning{Code: "unattached_image", Message: "An embedded image could not be attached to searchable content.", Line: image.line})
 			continue
 		}
 		images = append(images, DocumentImage{
@@ -495,7 +539,7 @@ func attachImagesToChunks(documentID string, embedded []embeddedImage, sections 
 			Alt: image.alt, MediaType: image.mediaType, Data: image.data, ContentHash: hashBytes(image.data),
 		})
 	}
-	return images
+	return images, warnings
 }
 
 func skipLine(line string) bool {

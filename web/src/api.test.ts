@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getSettings, loadDocumentChunks, SSEParser } from "./api";
+import { getSettings, importMarkdown, loadDocumentChunks, removeDocument, SSEParser } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -12,6 +12,25 @@ describe("getSettings", () => {
     }), { status: 200 })));
 
     await expect(getSettings()).resolves.toMatchObject({ environment_overrides: [] });
+  });
+});
+
+describe("importMarkdown", () => {
+  it("sends document metadata with the upload", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ documents: 1, chunks: 2, images: 0 }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await importMarkdown(new File(["# Manual"], "manual.md", { type: "text/markdown" }), true, { id: "synth", brand: "Acme", model: "A1", tags: "studio, synth" });
+    const body = fetchMock.mock.calls[0][1]?.body as FormData;
+    expect(Object.fromEntries(body.entries())).toMatchObject({ id: "synth", brand: "Acme", model: "A1", tags: "studio, synth", replace: "true" });
+  });
+});
+
+describe("removeDocument", () => {
+  it("deletes the encoded document ID", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await removeDocument("manual/one");
+    expect(fetchMock).toHaveBeenCalledWith("/api/documents/manual%2Fone", { method: "DELETE" });
   });
 });
 
