@@ -12,9 +12,10 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite/vec"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 type Store struct {
 	db   *sql.DB
@@ -52,6 +53,11 @@ type Chunk struct {
 	EndLine      int
 	Text         string
 	TextHash     string
+}
+
+type DocumentChunk struct {
+	Chunk
+	Images []ImageRef
 }
 
 type SearchOptions struct {
@@ -135,10 +141,16 @@ type RetrievalResult struct {
 }
 
 type RankDebug struct {
-	RawScore    float64
-	RerankScore float64
-	Quality     string
-	Reasons     []string
+	RawScore       float64
+	RerankScore    float64
+	Quality        string
+	Reasons        []string
+	Mode           string
+	FTSRank        int
+	VectorRank     int
+	VectorDistance float64
+	FusedScore     float64
+	FallbackReason string
 }
 
 type ShowOptions struct {
@@ -154,6 +166,26 @@ type DoctorReport struct {
 	Chunks        int
 	IndexedChunks int
 	OrphanChunks  int
+}
+
+type EmbeddingIndexStatus struct {
+	Configured bool   `json:"configured"`
+	Complete   bool   `json:"complete"`
+	Stale      bool   `json:"stale"`
+	Model      string `json:"model"`
+	Dimensions int    `json:"dimensions"`
+	Indexed    int    `json:"indexed"`
+	Total      int    `json:"total"`
+	UpdatedAt  string `json:"updated_at,omitempty"`
+}
+
+type EmbeddingChunk struct {
+	ID         int64
+	DocumentID string
+	Title      string
+	Heading    string
+	Text       string
+	TextHash   string
 }
 
 func Open(path string) (*Store, error) {
@@ -235,6 +267,13 @@ func (s *Store) Init() error {
 		`CREATE INDEX IF NOT EXISTS idx_document_images_chunk_id ON document_images(chunk_id);`,
 		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?);`,
 		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?);`,
+		`CREATE TABLE IF NOT EXISTS embedding_index_state (
+			id INTEGER PRIMARY KEY CHECK(id = 1), model TEXT NOT NULL, dimensions INTEGER NOT NULL,
+			config_hash TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0,
+			indexed_count INTEGER NOT NULL DEFAULT 0, total_count INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL
+		);`,
+		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, ?);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt, now()); err != nil {
@@ -308,6 +347,9 @@ func (s *Store) UpsertDocumentWithImages(ctx context.Context, doc Document, chun
 			return err
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE embedding_index_state SET complete = 0`); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -375,6 +417,9 @@ func (s *Store) RemoveDocument(ctx context.Context, id string) error {
 	}
 	if count == 0 {
 		return fmt.Errorf("document %q not found", id)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE embedding_index_state SET complete = 0`); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -468,6 +513,129 @@ func (s *Store) Retrieve(ctx context.Context, opts RetrieveOptions) (RetrievalRe
 		out.Blocks = append(out.Blocks, ContextBlock{Source: source, Text: chunk.Text, Images: images})
 	}
 	return out, nil
+}
+
+type hybridRanks struct {
+	ftsRank    int
+	vectorRank int
+	distance   float64
+	fused      float64
+}
+
+func (s *Store) RetrieveHybrid(ctx context.Context, opts RetrieveOptions, queryVector []float32) (RetrievalResult, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 8
+	}
+	query := NormalizeFTSQuery(opts.Query)
+	if query == "" {
+		return RetrievalResult{}, errors.New("empty retrieval query")
+	}
+	fetchLimit := opts.Limit * 5
+	lexical, err := s.retrieveWithQuery(ctx, opts, query, fetchLimit)
+	if err != nil {
+		return RetrievalResult{}, err
+	}
+	if len(lexical.Blocks) < fetchLimit && strings.Contains(query, " AND ") {
+		fallback, err := s.retrieveWithQuery(ctx, opts, strings.ReplaceAll(query, " AND ", " OR "), fetchLimit)
+		if err != nil {
+			return RetrievalResult{}, err
+		}
+		lexical.Blocks = mergeBlocks(lexical.Blocks, fallback.Blocks)
+	}
+	rawVector, err := json.Marshal(queryVector)
+	if err != nil {
+		return RetrievalResult{}, err
+	}
+	querySQL := `SELECT rowid, distance FROM chunk_embeddings WHERE embedding MATCH ? AND k = ?`
+	args := []any{string(rawVector), fetchLimit}
+	if opts.DocumentID != "" {
+		querySQL += ` AND document_id = ?`
+		args = append(args, opts.DocumentID)
+	}
+	querySQL += ` ORDER BY distance`
+	rows, err := s.db.QueryContext(ctx, querySQL, args...)
+	if err != nil {
+		return RetrievalResult{}, err
+	}
+	type vectorHit struct {
+		id       int64
+		distance float64
+	}
+	var vectorHits []vectorHit
+	for rows.Next() {
+		var hit vectorHit
+		if err := rows.Scan(&hit.id, &hit.distance); err != nil {
+			rows.Close()
+			return RetrievalResult{}, err
+		}
+		vectorHits = append(vectorHits, hit)
+	}
+	if err := rows.Close(); err != nil {
+		return RetrievalResult{}, err
+	}
+
+	chunks := map[int64]RetrievedChunk{}
+	ranks := map[int64]*hybridRanks{}
+	for i, block := range lexical.Blocks {
+		id := block.Source.ChunkID
+		chunks[id] = RetrievedChunk{ChunkID: id, DocumentID: block.Source.DocumentID, Title: block.Source.Title, Brand: block.Source.Brand, Model: block.Source.Model, HeadingPath: block.Source.HeadingPath, PageNumber: block.Source.PageNumber, StartLine: block.Source.StartLine, EndLine: block.Source.EndLine, Text: block.Text, Score: block.Source.Score}
+		ranks[id] = &hybridRanks{ftsRank: i + 1}
+	}
+	for i, hit := range vectorHits {
+		rank := ranks[hit.id]
+		if rank == nil {
+			rank = &hybridRanks{}
+			ranks[hit.id] = rank
+		}
+		rank.vectorRank = i + 1
+		rank.distance = hit.distance
+		if _, ok := chunks[hit.id]; !ok {
+			chunk, err := s.retrievedChunk(ctx, hit.id)
+			if err != nil {
+				return RetrievalResult{}, err
+			}
+			chunks[hit.id] = chunk
+		}
+	}
+	const rrfK = 60.0
+	candidates := make([]RetrievedChunk, 0, len(chunks))
+	for id, chunk := range chunks {
+		rank := ranks[id]
+		if rank.ftsRank > 0 {
+			rank.fused += 1 / (rrfK + float64(rank.ftsRank))
+		}
+		if rank.vectorRank > 0 {
+			rank.fused += 1 / (rrfK + float64(rank.vectorRank))
+		}
+		chunk.Score = -rank.fused * 100
+		candidates = append(candidates, chunk)
+	}
+	ranked := rerankChunks(opts.Query, candidates, opts.Limit)
+	out := RetrievalResult{Query: opts.Query, Blocks: make([]ContextBlock, 0, len(ranked))}
+	for i, chunk := range ranked {
+		rank := ranks[chunk.ChunkID]
+		debug := chunk.Debug
+		debug.Mode = "hybrid"
+		debug.FTSRank = rank.ftsRank
+		debug.VectorRank = rank.vectorRank
+		debug.VectorDistance = rank.distance
+		debug.FusedScore = rank.fused
+		source := SourceRef{ChunkID: chunk.ChunkID, Label: fmt.Sprintf("[%d]", i+1), DocumentID: chunk.DocumentID, Title: chunk.Title, Brand: chunk.Brand, Model: chunk.Model, HeadingPath: chunk.HeadingPath, PageNumber: chunk.PageNumber, StartLine: chunk.StartLine, EndLine: chunk.EndLine, Score: chunk.Score, Debug: debug}
+		images, err := s.imagesForChunk(ctx, chunk.ChunkID)
+		if err != nil {
+			return RetrievalResult{}, err
+		}
+		out.Blocks = append(out.Blocks, ContextBlock{Source: source, Text: chunk.Text, Images: images})
+	}
+	return out, nil
+}
+
+func (s *Store) retrievedChunk(ctx context.Context, id int64) (RetrievedChunk, error) {
+	var chunk RetrievedChunk
+	err := s.db.QueryRowContext(ctx, `SELECT c.id, c.document_id, d.title, d.brand, d.model, c.heading_path, c.page_number, c.start_line, c.end_line, c.text
+		FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = ?`, id).
+		Scan(&chunk.ChunkID, &chunk.DocumentID, &chunk.Title, &chunk.Brand, &chunk.Model, &chunk.HeadingPath, &chunk.PageNumber, &chunk.StartLine, &chunk.EndLine, &chunk.Text)
+	return chunk, err
 }
 
 func (s *Store) Image(ctx context.Context, id int64) (StoredImage, error) {
@@ -606,6 +774,20 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]SearchResult,
 	return out, nil
 }
 
+func (s *Store) SearchHybrid(ctx context.Context, opts SearchOptions, queryVector []float32) ([]SearchResult, error) {
+	retrieval, err := s.RetrieveHybrid(ctx, RetrieveOptions{Query: opts.Query, DocumentID: opts.DocumentID, Limit: opts.Limit, Debug: opts.Debug}, queryVector)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]SearchResult, 0, len(retrieval.Blocks))
+	for _, block := range retrieval.Blocks {
+		results = append(results, SearchResult{ChunkID: block.Source.ChunkID, DocumentID: block.Source.DocumentID, Title: block.Source.Title,
+			HeadingPath: block.Source.HeadingPath, PageNumber: block.Source.PageNumber, StartLine: block.Source.StartLine, EndLine: block.Source.EndLine,
+			Snippet: block.Text, Score: block.Source.Score, Debug: block.Source.Debug})
+	}
+	return results, nil
+}
+
 func (s *Store) searchWithQuery(ctx context.Context, opts SearchOptions, query string, fetchLimit int) ([]SearchResult, error) {
 	args := []any{query}
 	where := `chunks_fts MATCH ?`
@@ -675,6 +857,55 @@ func (s *Store) Show(ctx context.Context, opts ShowOptions) ([]Chunk, error) {
 	return chunks, rows.Err()
 }
 
+func (s *Store) DocumentChunks(ctx context.Context, documentID string, afterOrdinal, limit int) ([]DocumentChunk, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, document_id, ordinal, heading_path, heading_level, page_number, start_line, end_line, text, text_hash
+		FROM chunks WHERE document_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?`, documentID, afterOrdinal, limit)
+	if err != nil {
+		return nil, err
+	}
+	var chunks []DocumentChunk
+	for rows.Next() {
+		var item DocumentChunk
+		if err := rows.Scan(&item.ID, &item.DocumentID, &item.Ordinal, &item.HeadingPath, &item.HeadingLevel, &item.PageNumber, &item.StartLine, &item.EndLine, &item.Text, &item.TextHash); err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range chunks {
+		images, err := s.imagesForChunk(ctx, chunks[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		chunks[i].Images = images
+	}
+	return chunks, nil
+}
+
+func (s *Store) DocumentChunk(ctx context.Context, documentID string, chunkID int64) (DocumentChunk, error) {
+	var item DocumentChunk
+	err := s.db.QueryRowContext(ctx, `SELECT id, document_id, ordinal, heading_path, heading_level, page_number, start_line, end_line, text, text_hash
+		FROM chunks WHERE document_id = ? AND id = ?`, documentID, chunkID).
+		Scan(&item.ID, &item.DocumentID, &item.Ordinal, &item.HeadingPath, &item.HeadingLevel, &item.PageNumber, &item.StartLine, &item.EndLine, &item.Text, &item.TextHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DocumentChunk{}, fmt.Errorf("chunk %d not found", chunkID)
+	}
+	if err != nil {
+		return DocumentChunk{}, err
+	}
+	item.Images, err = s.imagesForChunk(ctx, item.ID)
+	return item, err
+}
+
 func (s *Store) Doctor(ctx context.Context) (DoctorReport, error) {
 	var report DoctorReport
 	report.FTS5 = s.verifyFTS5() == nil
@@ -689,6 +920,130 @@ func (s *Store) Doctor(ctx context.Context) (DoctorReport, error) {
 func (s *Store) verifyFTS5() error {
 	_, err := s.db.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS dogear_fts5_check USING fts5(value); DROP TABLE dogear_fts5_check;`)
 	return err
+}
+
+func (s *Store) EmbeddingStatus(ctx context.Context, model string, dimensions int, configHash string) (EmbeddingIndexStatus, error) {
+	status := EmbeddingIndexStatus{Configured: model != "", Model: model, Dimensions: dimensions}
+	chunks, err := s.EmbeddingChunks(ctx)
+	if err != nil {
+		return status, err
+	}
+	currentTotal := len(chunks)
+	status.Total = currentTotal
+	var complete int
+	var storedHash string
+	err = s.db.QueryRowContext(ctx, `SELECT model, dimensions, config_hash, complete, indexed_count, total_count, updated_at FROM embedding_index_state WHERE id = 1`).
+		Scan(&status.Model, &status.Dimensions, &storedHash, &complete, &status.Indexed, &status.Total, &status.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		status.Model = model
+		status.Dimensions = dimensions
+		status.Stale = model != ""
+		return status, nil
+	}
+	if err != nil {
+		return status, err
+	}
+	status.Complete = complete != 0 && status.Model == model && status.Dimensions == dimensions && storedHash == configHash && status.Indexed == currentTotal && status.Total == currentTotal
+	status.Total = currentTotal
+	status.Stale = model != "" && !status.Complete
+	return status, nil
+}
+
+func (s *Store) EmbeddingChunks(ctx context.Context) ([]EmbeddingChunk, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.document_id, d.title, c.heading_path, c.text, c.text_hash
+		FROM chunks c JOIN documents d ON d.id = c.document_id ORDER BY c.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var chunks []EmbeddingChunk
+	for rows.Next() {
+		var chunk EmbeddingChunk
+		if err := rows.Scan(&chunk.ID, &chunk.DocumentID, &chunk.Title, &chunk.Heading, &chunk.Text, &chunk.TextHash); err != nil {
+			return nil, err
+		}
+		if qualityClass(chunk.Heading, chunk.Text) == QualityTOC || qualityClass(chunk.Heading, chunk.Text) == QualityIndex || qualityClass(chunk.Heading, chunk.Text) == QualityReferenceOnly {
+			continue
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, rows.Err()
+}
+
+func (s *Store) BuildEmbeddingIndex(ctx context.Context, model string, dimensions, batchSize int, configHash string, force bool, embed func(context.Context, []string) ([][]float32, error), progress func(indexed, total int)) (EmbeddingIndexStatus, error) {
+	if model == "" {
+		return EmbeddingIndexStatus{}, errors.New("embedding model is not configured")
+	}
+	if dimensions < 32 || dimensions > 4096 {
+		return EmbeddingIndexStatus{}, errors.New("embedding dimensions must be between 32 and 4096")
+	}
+	status, err := s.EmbeddingStatus(ctx, model, dimensions, configHash)
+	if err != nil {
+		return status, err
+	}
+	if status.Complete && !force {
+		return status, nil
+	}
+	chunks, err := s.EmbeddingChunks(ctx)
+	if err != nil {
+		return status, err
+	}
+	if batchSize <= 0 {
+		batchSize = 16
+	}
+	vectors := make([][]float32, 0, len(chunks))
+	for start := 0; start < len(chunks); start += batchSize {
+		end := min(start+batchSize, len(chunks))
+		input := make([]string, 0, end-start)
+		for _, chunk := range chunks[start:end] {
+			input = append(input, "Title: "+chunk.Title+"\nSection: "+chunk.Heading+"\n\n"+chunk.Text)
+		}
+		batch, err := embed(ctx, input)
+		if err != nil {
+			return status, err
+		}
+		if len(batch) != len(input) {
+			return status, fmt.Errorf("embedding provider returned %d vectors for %d chunks", len(batch), len(input))
+		}
+		vectors = append(vectors, batch...)
+		if progress != nil {
+			progress(end, len(chunks))
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return status, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS chunk_embeddings`); err != nil {
+		return status, err
+	}
+	create := fmt.Sprintf(`CREATE VIRTUAL TABLE chunk_embeddings USING vec0(embedding float[%d], document_id text partition key)`, dimensions)
+	if _, err := tx.ExecContext(ctx, create); err != nil {
+		return status, err
+	}
+	for i, chunk := range chunks {
+		raw, err := json.Marshal(vectors[i])
+		if err != nil {
+			return status, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO chunk_embeddings(rowid, embedding, document_id) VALUES(?, ?, ?)`, chunk.ID, string(raw), chunk.DocumentID); err != nil {
+			return status, err
+		}
+	}
+	timestamp := now()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO embedding_index_state(id, model, dimensions, config_hash, complete, indexed_count, total_count, updated_at)
+		VALUES(1, ?, ?, ?, 1, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET model=excluded.model, dimensions=excluded.dimensions, config_hash=excluded.config_hash,
+		complete=1, indexed_count=excluded.indexed_count, total_count=excluded.total_count, updated_at=excluded.updated_at`,
+		model, dimensions, configHash, len(chunks), len(chunks), timestamp); err != nil {
+		return status, err
+	}
+	if err := tx.Commit(); err != nil {
+		return status, err
+	}
+	return EmbeddingIndexStatus{Configured: true, Complete: true, Model: model, Dimensions: dimensions, Indexed: len(chunks), Total: len(chunks), UpdatedAt: timestamp}, nil
 }
 
 func now() string {

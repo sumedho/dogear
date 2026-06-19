@@ -33,6 +33,7 @@ func TestAPIEndpoints(t *testing.T) {
 		{name: "document", path: "/api/documents/test-synth"},
 		{name: "search", path: "/api/search?q=local+control"},
 		{name: "context", path: "/api/context?q=local+control"},
+		{name: "document chunks", path: "/api/documents/test-synth/chunks"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -46,6 +47,57 @@ func TestAPIEndpoints(t *testing.T) {
 				t.Fatalf("content type = %q", contentType)
 			}
 		})
+	}
+}
+
+func TestSettingsAPIHidesKeys(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	content := `[provider]
+base_url = "http://localhost:8000/v1"
+model = "chat"
+api_key = "top-secret"
+timeout = "60s"
+[embedding]
+base_url = "http://localhost:8000/v1"
+model = "embed"
+api_key = "embedding-secret"
+dimensions = 1024
+batch_size = 16
+timeout = "120s"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(Options{Store: testStore(t), ConfigPath: configPath})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), "top-secret") || strings.Contains(response.Body.String(), "embedding-secret") {
+		t.Fatalf("unsafe settings response: %d %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"api_key_set":true`) {
+		t.Fatalf("missing masked key state: %s", response.Body.String())
+	}
+	var payload settingsPayload
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Embedding.Model != "embed" || payload.Embedding.Dimensions != 1024 {
+		t.Fatalf("unexpected settings: %#v", payload)
+	}
+	payload.Provider.Model = "updated-chat"
+	payload.Provider.APIKeyAction = "preserve"
+	payload.Embedding.APIKeyAction = "preserve"
+	raw, _ := json.Marshal(payload)
+	update := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(raw))
+	request.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(update, request)
+	if update.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", update.Code, update.Body.String())
+	}
+	saved, _ := os.ReadFile(configPath)
+	if !strings.Contains(string(saved), `model = "updated-chat"`) || !strings.Contains(string(saved), `api_key = "top-secret"`) {
+		t.Fatalf("settings update lost values: %s", saved)
 	}
 }
 

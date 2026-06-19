@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -231,6 +232,49 @@ func TestImportMarkdownRejectsInvalidEmbeddedImage(t *testing.T) {
 	content := []byte("# Manual\n\n## Setup\n\nText.\n\n![Wrong](data:image/jpeg;base64," + testPNGBase64 + ")\n")
 	if _, err := ImportMarkdown(context.Background(), store, "manual.md", content, ImportMetadata{}, false); err == nil {
 		t.Fatal("ImportMarkdown() error = nil, want MIME mismatch")
+	}
+}
+
+func TestEmbeddingIndexAndHybridRetrieval(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "dogear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("# Manual\n\n## MIDI Sync\n\nConfigure MIDI clock synchronization here with transport controls.\n\n## Audio\n\nAdjust output volume and speaker balance from this menu.\n")
+	if _, err := ImportMarkdown(context.Background(), store, "manual.md", content, ImportMetadata{ID: "manual"}, false); err != nil {
+		t.Fatal(err)
+	}
+	embed := func(_ context.Context, input []string) ([][]float32, error) {
+		out := make([][]float32, len(input))
+		for i, text := range input {
+			out[i] = make([]float32, 32)
+			if strings.Contains(strings.ToLower(text), "midi") {
+				out[i][0] = 1
+			} else {
+				out[i][1] = 1
+			}
+		}
+		return out, nil
+	}
+	status, err := store.BuildEmbeddingIndex(context.Background(), "test-embedding", 32, 8, "hash", false, embed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Complete || status.Indexed != 2 {
+		t.Fatalf("unexpected status: %#v", status)
+	}
+	query := make([]float32, 32)
+	query[0] = 1
+	result, err := store.RetrieveHybrid(context.Background(), RetrieveOptions{Query: "clock synchronization", DocumentID: "manual", Limit: 2}, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Blocks) == 0 || !strings.Contains(result.Blocks[0].Source.HeadingPath, "MIDI Sync") || result.Blocks[0].Source.Debug.Mode != "hybrid" {
+		t.Fatalf("unexpected hybrid result: %#v", result)
 	}
 }
 

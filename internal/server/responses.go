@@ -35,6 +35,7 @@ type searchResultResponse struct {
 }
 
 type sourceRefResponse struct {
+	ChunkID     int64              `json:"chunk_id"`
 	Label       string             `json:"label"`
 	DocumentID  string             `json:"document_id"`
 	Title       string             `json:"title"`
@@ -49,10 +50,16 @@ type sourceRefResponse struct {
 }
 
 type rankDebugResponse struct {
-	RawScore    float64  `json:"raw_score"`
-	RerankScore float64  `json:"rerank_score"`
-	Quality     string   `json:"quality"`
-	Reasons     []string `json:"reasons"`
+	RawScore       float64  `json:"raw_score"`
+	RerankScore    float64  `json:"rerank_score"`
+	Quality        string   `json:"quality"`
+	Reasons        []string `json:"reasons"`
+	Mode           string   `json:"mode,omitempty"`
+	FTSRank        int      `json:"fts_rank,omitempty"`
+	VectorRank     int      `json:"vector_rank,omitempty"`
+	VectorDistance float64  `json:"vector_distance,omitempty"`
+	FusedScore     float64  `json:"fused_score,omitempty"`
+	FallbackReason string   `json:"fallback_reason,omitempty"`
 }
 
 type contextBlockResponse struct {
@@ -63,6 +70,42 @@ type contextBlockResponse struct {
 type retrievalResultResponse struct {
 	Query  string                 `json:"query"`
 	Blocks []contextBlockResponse `json:"blocks"`
+}
+
+type documentChunkResponse struct {
+	ID           int64              `json:"id"`
+	DocumentID   string             `json:"document_id"`
+	Ordinal      int                `json:"ordinal"`
+	HeadingPath  string             `json:"heading_path"`
+	HeadingLevel int                `json:"heading_level"`
+	PageNumber   *int64             `json:"page_number"`
+	StartLine    int                `json:"start_line"`
+	EndLine      int                `json:"end_line"`
+	Text         string             `json:"text"`
+	Images       []imageRefResponse `json:"images,omitempty"`
+}
+
+type imageRefResponse struct {
+	ID        int64  `json:"id"`
+	Alt       string `json:"alt"`
+	MediaType string `json:"media_type"`
+}
+
+func documentChunkResponses(chunks []dogear.DocumentChunk) []documentChunkResponse {
+	out := make([]documentChunkResponse, 0, len(chunks))
+	for _, chunk := range chunks {
+		out = append(out, documentChunkResponseFor(chunk))
+	}
+	return out
+}
+
+func documentChunkResponseFor(chunk dogear.DocumentChunk) documentChunkResponse {
+	images := make([]imageRefResponse, 0, len(chunk.Images))
+	for _, image := range chunk.Images {
+		images = append(images, imageRefResponse{ID: image.ID, Alt: image.Alt, MediaType: image.MediaType})
+	}
+	return documentChunkResponse{ID: chunk.ID, DocumentID: chunk.DocumentID, Ordinal: chunk.Ordinal, HeadingPath: chunk.HeadingPath,
+		HeadingLevel: chunk.HeadingLevel, PageNumber: nullIntPtr(chunk.PageNumber), StartLine: chunk.StartLine, EndLine: chunk.EndLine, Text: chunk.Text, Images: images}
 }
 
 func documentInfoResponses(infos []dogear.DocumentInfo) []documentInfoResponse {
@@ -111,7 +154,7 @@ func retrievalResultResponseFor(result dogear.RetrievalResult, includeDebug bool
 
 func sourceRefResponseFor(source dogear.SourceRef, includeDebug bool) sourceRefResponse {
 	return sourceRefResponse{
-		Label: source.Label, DocumentID: source.DocumentID, Title: source.Title,
+		ChunkID: source.ChunkID, Label: source.Label, DocumentID: source.DocumentID, Title: source.Title,
 		Brand: source.Brand, Model: source.Model, HeadingPath: source.HeadingPath,
 		PageNumber: nullIntPtr(source.PageNumber), StartLine: source.StartLine, EndLine: source.EndLine,
 		Score: source.Score, Debug: rankDebugResponseFor(source.Debug, includeDebug),
@@ -124,7 +167,9 @@ func rankDebugResponseFor(debug dogear.RankDebug, include bool) *rankDebugRespon
 	}
 	return &rankDebugResponse{
 		RawScore: debug.RawScore, RerankScore: debug.RerankScore,
-		Quality: debug.Quality, Reasons: debug.Reasons,
+		Quality: debug.Quality, Reasons: debug.Reasons, Mode: debug.Mode,
+		FTSRank: debug.FTSRank, VectorRank: debug.VectorRank, VectorDistance: debug.VectorDistance,
+		FusedScore: debug.FusedScore, FallbackReason: debug.FallbackReason,
 	}
 }
 

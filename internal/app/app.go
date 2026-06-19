@@ -51,6 +51,7 @@ type AskResult struct {
 }
 
 type SourceRef struct {
+	ChunkID     int64   `json:"chunk_id"`
 	Label       string  `json:"label"`
 	DocumentID  string  `json:"document_id"`
 	Title       string  `json:"title"`

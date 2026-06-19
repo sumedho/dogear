@@ -4,11 +4,14 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,8 +20,10 @@ import (
 	dogearadapter "github.com/sumedho/dogear/internal/adapters/dogear"
 	"github.com/sumedho/dogear/internal/app"
 	"github.com/sumedho/dogear/internal/dogear"
+	"github.com/sumedho/dogear/internal/embedding"
 	"github.com/sumedho/dogear/internal/llm"
 	"github.com/sumedho/dogear/internal/logging"
+	"github.com/sumedho/dogear/internal/settings"
 )
 
 //go:embed static/*
@@ -31,11 +36,12 @@ type Options struct {
 }
 
 type Handler struct {
-	store      *dogear.Store
-	retriever  app.Retriever
-	configPath string
-	logger     *slog.Logger
-	mux        *http.ServeMux
+	store        *dogear.Store
+	retriever    app.Retriever
+	rawRetriever dogearadapter.Retriever
+	configPath   string
+	logger       *slog.Logger
+	mux          *http.ServeMux
 }
 
 type askRequest struct {
@@ -72,12 +78,14 @@ func New(options Options) http.Handler {
 	if logger == nil {
 		logger = logging.Discard()
 	}
+	rawRetriever := dogearadapter.NewConfiguredRetriever(options.Store, options.ConfigPath)
 	handler := &Handler{
-		store:      options.Store,
-		retriever:  dogearadapter.NewRetriever(options.Store),
-		configPath: options.ConfigPath,
-		logger:     logger,
-		mux:        http.NewServeMux(),
+		store:        options.Store,
+		retriever:    rawRetriever,
+		rawRetriever: rawRetriever,
+		configPath:   options.ConfigPath,
+		logger:       logger,
+		mux:          http.NewServeMux(),
 	}
 	handler.routes()
 	return handler
@@ -146,18 +154,271 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/health", h.health)
 	h.mux.HandleFunc("GET /api/documents", h.documents)
 	h.mux.HandleFunc("GET /api/documents/{id}", h.document)
+	h.mux.HandleFunc("GET /api/documents/{id}/chunks", h.documentChunks)
+	h.mux.HandleFunc("GET /api/documents/{id}/chunks/{chunkID}", h.documentChunk)
 	h.mux.HandleFunc("GET /api/search", h.search)
 	h.mux.HandleFunc("GET /api/context", h.context)
 	h.mux.HandleFunc("POST /api/ask", h.ask)
 	h.mux.HandleFunc("POST /api/ask/stream", h.askStream)
 	h.mux.HandleFunc("POST /api/import", h.importMarkdown)
 	h.mux.HandleFunc("GET /api/images/{id}", h.image)
+	h.mux.HandleFunc("GET /api/settings", h.getSettings)
+	h.mux.HandleFunc("PUT /api/settings", h.putSettings)
+	h.mux.HandleFunc("POST /api/settings/test", h.testSettings)
+	h.mux.HandleFunc("GET /api/index/embeddings/status", h.embeddingIndexStatus)
+	h.mux.HandleFunc("POST /api/index/embeddings/stream", h.buildEmbeddingIndex)
 
 	static, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		panic(err)
 	}
 	h.mux.Handle("/", http.FileServer(http.FS(static)))
+}
+
+type settingsProviderPayload struct {
+	BaseURL      string `json:"base_url"`
+	Model        string `json:"model"`
+	Timeout      string `json:"timeout"`
+	APIKey       string `json:"api_key,omitempty"`
+	APIKeySet    bool   `json:"api_key_set"`
+	APIKeyAction string `json:"api_key_action,omitempty"`
+}
+type settingsEmbeddingPayload struct {
+	settingsProviderPayload
+	Dimensions       int    `json:"dimensions"`
+	BatchSize        int    `json:"batch_size"`
+	QueryInstruction string `json:"query_instruction"`
+}
+type settingsPayload struct {
+	Provider  settingsProviderPayload  `json:"provider"`
+	Embedding settingsEmbeddingPayload `json:"embedding"`
+	Overrides []string                 `json:"environment_overrides"`
+}
+
+func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
+	values, err := settings.Read(h.configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	payload := settingsPayload{
+		Provider:  settingsProviderPayload{BaseURL: values.Provider.BaseURL, Model: values.Provider.Model, Timeout: values.Provider.Timeout.String(), APIKeySet: values.Provider.APIKey != ""},
+		Embedding: settingsEmbeddingPayload{settingsProviderPayload: settingsProviderPayload{BaseURL: values.Embedding.BaseURL, Model: values.Embedding.Model, Timeout: values.Embedding.Timeout.String(), APIKeySet: values.Embedding.APIKey != ""}, Dimensions: values.Embedding.Dimensions, BatchSize: values.Embedding.BatchSize, QueryInstruction: values.Embedding.QueryInstruction},
+	}
+	for _, key := range []string{"DOGEAR_BASE_URL", "DOGEAR_API_KEY", "DOGEAR_MODEL", "DOGEAR_TIMEOUT", "DOGEAR_EMBEDDING_BASE_URL", "DOGEAR_EMBEDDING_API_KEY", "DOGEAR_EMBEDDING_MODEL", "DOGEAR_EMBEDDING_DIMENSIONS", "DOGEAR_EMBEDDING_BATCH_SIZE"} {
+		if _, ok := os.LookupEnv(key); ok {
+			payload.Overrides = append(payload.Overrides, key)
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
+	var payload settingsPayload
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	current, err := settings.Read(h.configPath)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	providerTimeout, err := time.ParseDuration(payload.Provider.Timeout)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid provider timeout: %w", err))
+		return
+	}
+	embedTimeout, err := time.ParseDuration(payload.Embedding.Timeout)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid embedding timeout: %w", err))
+		return
+	}
+	current.Provider.BaseURL = strings.TrimSpace(payload.Provider.BaseURL)
+	current.Provider.Model = strings.TrimSpace(payload.Provider.Model)
+	current.Provider.Timeout = providerTimeout
+	current.Embedding.BaseURL = strings.TrimSpace(payload.Embedding.BaseURL)
+	current.Embedding.Model = strings.TrimSpace(payload.Embedding.Model)
+	current.Embedding.Timeout = embedTimeout
+	current.Embedding.Dimensions = payload.Embedding.Dimensions
+	current.Embedding.BatchSize = payload.Embedding.BatchSize
+	current.Embedding.QueryInstruction = strings.TrimSpace(payload.Embedding.QueryInstruction)
+	if err := applyKeyAction(&current.Provider.APIKey, payload.Provider.APIKeyAction, payload.Provider.APIKey); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := applyKeyAction(&current.Embedding.APIKey, payload.Embedding.APIKeyAction, payload.Embedding.APIKey); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := settings.Write(h.configPath, current); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	h.logger.InfoContext(r.Context(), "settings updated")
+	h.getSettings(w, r)
+}
+
+func applyKeyAction(current *string, action, value string) error {
+	switch action {
+	case "", "preserve":
+		return nil
+	case "clear":
+		*current = ""
+		return nil
+	case "replace":
+		if strings.TrimSpace(value) == "" {
+			return errors.New("replacement API key is empty")
+		}
+		*current = strings.TrimSpace(value)
+		return nil
+	default:
+		return fmt.Errorf("invalid API key action %q", action)
+	}
+}
+
+func (h *Handler) resolvedEmbedding(ctx context.Context) (embedding.Config, error) {
+	provider, err := app.ProviderConfig(h.configPath, app.ProviderOverride{})
+	if err != nil {
+		return embedding.Config{}, err
+	}
+	return embedding.Resolve(h.configPath, provider.BaseURL, provider.APIKey)
+}
+
+func (h *Handler) testSettings(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Target string `json:"target"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if request.Target == "embedding" {
+		config, err := h.resolvedEmbedding(r.Context())
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		client, err := embedding.NewClient(config)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		vectors, err := client.Embed(r.Context(), []string{"Dogear embedding connectivity test"})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "model": config.Model, "dimensions": len(vectors[0])})
+		return
+	}
+	provider, err := app.ProviderConfig(h.configPath, app.ProviderOverride{})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := testModelEndpoint(r.Context(), provider); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "model": provider.Model})
+}
+
+func testModelEndpoint(ctx context.Context, config llm.Config) error {
+	u, err := url.Parse(config.BaseURL)
+	if err != nil {
+		return err
+	}
+	u.Path = strings.TrimSuffix(strings.TrimSuffix(u.Path, "/chat/completions"), "/") + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	if config.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	}
+	client := &http.Client{Timeout: config.Timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("model endpoint returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (h *Handler) embeddingIndexStatus(w http.ResponseWriter, r *http.Request) {
+	config, err := h.resolvedEmbedding(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	status, err := h.store.EmbeddingStatus(r.Context(), config.Model, config.Dimensions, config.IndexHash())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) buildEmbeddingIndex(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming is not supported"))
+		return
+	}
+	config, err := h.resolvedEmbedding(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	client, err := embedding.NewClient(config)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	status, err := h.store.BuildEmbeddingIndex(r.Context(), config.Model, config.Dimensions, config.BatchSize, config.IndexHash(), parseBool(r.URL.Query().Get("force")), client.Embed, func(indexed, total int) {
+		_ = writeSSE(w, "progress", map[string]int{"indexed": indexed, "total": total})
+		flusher.Flush()
+	})
+	if err != nil {
+		_ = writeSSE(w, "error", errorResponse{Error: err.Error()})
+		flusher.Flush()
+		return
+	}
+	_ = writeSSE(w, "result", status)
+	flusher.Flush()
+}
+
+func (h *Handler) documentChunks(w http.ResponseWriter, r *http.Request) {
+	after, _ := strconv.Atoi(r.URL.Query().Get("after"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	chunks, err := h.store.DocumentChunks(r.Context(), r.PathValue("id"), after, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, documentChunkResponses(chunks))
+}
+
+func (h *Handler) documentChunk(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("chunkID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid chunk id"))
+		return
+	}
+	chunk, err := h.store.DocumentChunk(r.Context(), r.PathValue("id"), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, documentChunkResponseFor(chunk))
 }
 
 func (h *Handler) importMarkdown(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +523,7 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	debug := parseBool(r.URL.Query().Get("debug"))
-	results, err := h.store.Search(r.Context(), dogear.SearchOptions{
+	results, err := h.rawRetriever.SearchRaw(r.Context(), dogear.SearchOptions{
 		Query:      query,
 		DocumentID: strings.TrimSpace(r.URL.Query().Get("doc")),
 		Limit:      limit,
@@ -287,7 +548,7 @@ func (h *Handler) context(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	debug := parseBool(r.URL.Query().Get("debug"))
-	result, err := h.store.Retrieve(r.Context(), dogear.RetrieveOptions{
+	result, err := h.rawRetriever.RetrieveRaw(r.Context(), dogear.RetrieveOptions{
 		Query:      query,
 		DocumentID: strings.TrimSpace(r.URL.Query().Get("doc")),
 		Limit:      limit,

@@ -1,4 +1,4 @@
-import type { AskResult, DocumentInfo } from "./types";
+import type { AskResult, DocumentChunk, DocumentInfo, EmbeddingIndexStatus, Settings } from "./types";
 
 async function json<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, options);
@@ -16,6 +16,27 @@ export async function importMarkdown(file: File, replace: boolean): Promise<{ do
   form.set("file", file);
   form.set("replace", String(replace));
   return json("/api/import", { method: "POST", body: form });
+}
+
+export function listDocumentChunks(documentId: string, after = 0): Promise<DocumentChunk[]> {
+  return json(`/api/documents/${encodeURIComponent(documentId)}/chunks?after=${after}&limit=50`);
+}
+export function getDocumentChunk(documentId: string, chunkId: number): Promise<DocumentChunk> {
+  return json(`/api/documents/${encodeURIComponent(documentId)}/chunks/${chunkId}`);
+}
+export function getSettings(): Promise<Settings> { return json("/api/settings"); }
+export function saveSettings(settings: Settings): Promise<Settings> { return json("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(settings) }); }
+export function testSettings(target: "provider" | "embedding"): Promise<{ ok: boolean; model: string; dimensions?: number }> { return json("/api/settings/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }) }); }
+export function embeddingIndexStatus(): Promise<EmbeddingIndexStatus> { return json("/api/index/embeddings/status"); }
+
+export async function buildEmbeddingIndex(onProgress: (indexed: number, total: number) => void): Promise<EmbeddingIndexStatus> {
+  const response = await fetch("/api/index/embeddings/stream", { method: "POST" });
+  if (!response.ok || !response.body) throw new Error((await response.json().catch(() => ({})) as { error?: string }).error || response.statusText);
+  const reader = response.body.getReader(); const decoder = new TextDecoder(); const parser = new SSEParser();
+  let result: EmbeddingIndexStatus | undefined; let error: Error | undefined;
+  const emit = (event: string, data: string) => { const value = JSON.parse(data) as EmbeddingIndexStatus & { error?: string; indexed: number; total: number }; if (event === "progress") onProgress(value.indexed, value.total); if (event === "result") result = value; if (event === "error") error = new Error(value.error || "Index build failed"); };
+  while (true) { const next = await reader.read(); if (next.done) break; parser.push(decoder.decode(next.value, { stream: true }), emit); }
+  if (error) throw error; if (!result) throw new Error("Index build ended without a result"); return result;
 }
 
 export interface StreamHandlers {

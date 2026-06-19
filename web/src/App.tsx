@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { importMarkdown, listDocuments, streamAsk } from "./api";
+import { buildEmbeddingIndex, embeddingIndexStatus, getDocumentChunk, getSettings, importMarkdown, listDocumentChunks, listDocuments, saveSettings, streamAsk, testSettings } from "./api";
 import { loadChats, newChat, saveChats } from "./storage";
-import type { AskResult, Chat, ChatMessage, DocumentInfo, SourceRef } from "./types";
+import type { AskResult, Chat, ChatMessage, DocumentChunk, DocumentInfo, EmbeddingIndexStatus, Settings, SourceRef } from "./types";
 
 function sourceDescription(source: SourceRef): string {
   const parts = [source.title];
@@ -25,6 +25,8 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [browseOpen, setBrowseOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [viewer, setViewer] = useState<{ documentId: string; chunkId?: number } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loadingDocs, setLoadingDocs] = useState(true);
   const [docsError, setDocsError] = useState("");
@@ -45,6 +47,10 @@ export default function App() {
   };
 
   useEffect(() => void refreshDocuments(), []);
+	useEffect(() => {
+		const restore = () => { const match = location.hash.match(/^#manual\/([^/]+)(?:\/chunk\/(\d+))?/); setViewer(match ? { documentId: decodeURIComponent(match[1]), chunkId: match[2] ? Number(match[2]) : undefined } : null); };
+		restore(); window.addEventListener("hashchange", restore); return () => window.removeEventListener("hashchange", restore);
+	}, []);
   useEffect(() => saveChats(chats), [chats]);
   useEffect(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), [current?.messages]);
 
@@ -134,6 +140,7 @@ export default function App() {
   };
 
   const activeDocument = documents.find((document) => document.id === current.documentId);
+	const openViewer = (documentId: string, chunkId?: number) => { location.hash = `manual/${encodeURIComponent(documentId)}${chunkId ? `/chunk/${chunkId}` : ""}`; };
 
   return (
     <div className="app-shell">
@@ -147,6 +154,7 @@ export default function App() {
         <div className="library-actions">
           <button onClick={() => setBrowseOpen(true)}>▤ <span>Browse manuals</span></button>
           <button onClick={() => setImportOpen(true)}>⇧ <span>Import Markdown</span></button>
+			<button onClick={() => setSettingsOpen(true)}>⚙ <span>Settings</span></button>
         </div>
         <div className="sidebar-label">Chats</div>
         <nav className="chat-list">
@@ -189,7 +197,7 @@ export default function App() {
                 ) : <div className="user-text">{message.content}</div>}
                 {message.status === "streaming" && <span className="streaming-cursor" aria-label="Streaming" />}
                 {message.error && <div className={`message-error ${message.status === "cancelled" ? "muted" : ""}`}>{message.error}</div>}
-                {message.sources && message.sources.length > 0 && <SourceCards message={message} />}
+                {message.sources && message.sources.length > 0 && <SourceCards message={message} onOpen={openViewer} />}
               </div>
             </article>
           ))}
@@ -218,14 +226,16 @@ export default function App() {
         </div>
       </main>
 
-      {browseOpen && <ManualDialog documents={documents} loading={loadingDocs} error={docsError} onRefresh={refreshDocuments} onSelect={(id) => { selectDocument(id); setBrowseOpen(false); }} onClose={() => setBrowseOpen(false)} />}
+      {browseOpen && <ManualDialog documents={documents} loading={loadingDocs} error={docsError} onRefresh={refreshDocuments} onSelect={(id) => { selectDocument(id); setBrowseOpen(false); }} onOpen={(id) => { setBrowseOpen(false); openViewer(id); }} onClose={() => setBrowseOpen(false)} />}
       {importOpen && <ImportDialog onClose={() => setImportOpen(false)} onImported={refreshDocuments} />}
+		{settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+		{viewer && <ManualViewer manual={documents.find((item) => item.id === viewer.documentId)} documentId={viewer.documentId} chunkId={viewer.chunkId} onClose={() => { history.pushState(null, "", location.pathname + location.search); setViewer(null); }} />}
       {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar" />}
     </div>
   );
 }
 
-function SourceCards({ message }: { message: ChatMessage }) {
+function SourceCards({ message, onOpen }: { message: ChatMessage; onOpen(documentId: string, chunkId?: number): void }) {
   const blocks = message.retrieval?.blocks || [];
   return (
     <details className="sources" open>
@@ -234,11 +244,11 @@ function SourceCards({ message }: { message: ChatMessage }) {
         {message.sources?.map((source) => {
           const block = blocks.find((item) => item.source.label === source.label);
           return (
-            <div className="source-card" key={`${source.document_id}-${source.label}`}>
+            <button className="source-card" key={`${source.document_id}-${source.label}`} onClick={() => onOpen(source.document_id, source.chunk_id)}>
               <div className="source-title"><span>{source.label}</span> {sourceDescription(source)}</div>
               {block?.text && <p>{block.text}</p>}
               {block?.images?.map((image) => <img key={image.id} src={`/api/images/${image.id}`} alt={image.alt} loading="lazy" />)}
-            </div>
+            </button>
           );
         })}
       </div>
@@ -246,8 +256,8 @@ function SourceCards({ message }: { message: ChatMessage }) {
   );
 }
 
-function ManualDialog({ documents, loading, error, onRefresh, onSelect, onClose }: {
-  documents: DocumentInfo[]; loading: boolean; error: string; onRefresh(): Promise<void>; onSelect(id: string): void; onClose(): void;
+function ManualDialog({ documents, loading, error, onRefresh, onSelect, onOpen, onClose }: {
+  documents: DocumentInfo[]; loading: boolean; error: string; onRefresh(): Promise<void>; onSelect(id: string): void; onOpen(id: string): void; onClose(): void;
 }) {
   return <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-label="Manual library">
     <div className="modal-header"><div><h2>Manual library</h2><p>Select the manual used by the current chat.</p></div><button className="icon-button" onClick={onClose}>×</button></div>
@@ -255,11 +265,61 @@ function ManualDialog({ documents, loading, error, onRefresh, onSelect, onClose 
     {error && <div className="message-error">{error} <button onClick={() => void onRefresh()}>Retry</button></div>}
     {!loading && !error && <div className="manual-list">
       <button className="manual-item" onClick={() => onSelect("")}><strong>All manuals</strong><span>Search every imported document</span></button>
-      {documents.map((document) => <button className="manual-item" key={document.id} onClick={() => onSelect(document.id)}>
+      {documents.map((document) => <div className="manual-item" key={document.id}>
         <strong>{document.title}</strong><span>{[document.brand, document.model].filter(Boolean).join(" ") || document.id} · {document.chunk_count} chunks · {document.page_count} pages</span>
-      </button>)}
+		<div><button onClick={() => onSelect(document.id)}>Use in chat</button><button onClick={() => onOpen(document.id)}>Open manual</button></div>
+      </div>)}
     </div>}
   </div></div>;
+}
+
+function ManualViewer({ manual, documentId, chunkId, onClose }: { manual?: DocumentInfo; documentId: string; chunkId?: number; onClose(): void }) {
+  const [chunks, setChunks] = useState<DocumentChunk[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true; setLoading(true);
+    Promise.all([listDocumentChunks(documentId), chunkId ? getDocumentChunk(documentId, chunkId) : Promise.resolve(undefined)]).then(([page, target]) => {
+      if (!active) return; const combined = target && !page.some((item) => item.id === target.id) ? [target, ...page] : page; setChunks(combined); setLoading(false);
+      setTimeout(() => document.getElementById(`chunk-${chunkId}`)?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+    }).catch((reason) => { if (active) { setError(reason instanceof Error ? reason.message : "Could not load manual"); setLoading(false); } });
+    return () => { active = false; };
+  }, [documentId, chunkId]);
+  const loadMore = async () => { const last = chunks.reduce((max, item) => Math.max(max, item.ordinal), 0); const next = await listDocumentChunks(documentId, last); setChunks((items) => [...items, ...next.filter((candidate) => !items.some((item) => item.id === candidate.id))]); };
+  return <div className="viewer-backdrop"><section className="manual-viewer" role="dialog" aria-modal="true">
+    <header><div><h2>{manual?.title || documentId}</h2><span>{manual?.brand} {manual?.model}</span></div><button className="icon-button" onClick={onClose}>×</button></header>
+    <div className="viewer-layout"><nav>{chunks.map((chunk) => <a key={chunk.id} href={`#manual/${encodeURIComponent(documentId)}/chunk/${chunk.id}`}>{chunk.heading_path || `Chunk ${chunk.ordinal}`}</a>)}</nav>
+      <main>{loading && <p>Loading manual…</p>}{error && <div className="message-error">{error}</div>}{chunks.map((chunk) => <article id={`chunk-${chunk.id}`} className={chunk.id === chunkId ? "target-chunk" : ""} key={chunk.id}>
+        <h3>{chunk.heading_path}</h3><div className="chunk-meta">{chunk.page_number ? `Page ${chunk.page_number} · ` : ""}lines {chunk.start_line}–{chunk.end_line}</div>
+        <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{chunk.text}</ReactMarkdown></div>
+        {chunk.images?.map((image) => <img key={image.id} src={`/api/images/${image.id}`} alt={image.alt} loading="lazy" />)}
+      </article>)}{chunks.length > 0 && <button className="load-more" onClick={() => void loadMore()}>Load more</button>}</main>
+    </div>
+  </section></div>;
+}
+
+function SettingsDialog({ onClose }: { onClose(): void }) {
+  const [value, setValue] = useState<Settings | null>(null); const [index, setIndex] = useState<EmbeddingIndexStatus | null>(null);
+  const [status, setStatus] = useState("Loading…"); const [busy, setBusy] = useState(false);
+  const refresh = async () => { try { const [settings, indexStatus] = await Promise.all([getSettings(), embeddingIndexStatus()]); setValue(settings); setIndex(indexStatus); setStatus(""); } catch (error) { setStatus(error instanceof Error ? error.message : "Could not load settings"); } };
+  useEffect(() => void refresh(), []);
+  if (!value) return <div className="modal-backdrop"><div className="modal"><div className="modal-header"><h2>Settings</h2><button className="icon-button" onClick={onClose}>×</button></div><p>{status}</p></div></div>;
+  const changeProvider = (field: string, fieldValue: string) => setValue({ ...value, provider: { ...value.provider, [field]: fieldValue } });
+  const changeEmbedding = (field: string, fieldValue: string | number) => setValue({ ...value, embedding: { ...value.embedding, [field]: fieldValue } });
+  const save = async () => { setBusy(true); try { setValue(await saveSettings(value)); setStatus("Settings saved"); await refresh(); } catch (error) { setStatus(error instanceof Error ? error.message : "Save failed"); } finally { setBusy(false); } };
+  const test = async (target: "provider" | "embedding") => { setBusy(true); try { const result = await testSettings(target); setStatus(`${target} connection OK: ${result.model}${result.dimensions ? ` (${result.dimensions} dimensions)` : ""}`); } catch (error) { setStatus(error instanceof Error ? error.message : "Test failed"); } finally { setBusy(false); } };
+  const build = async () => { setBusy(true); try { const result = await buildEmbeddingIndex((indexed, total) => setStatus(`Embedding ${indexed}/${total} chunks…`)); setIndex(result); setStatus("Embedding index complete"); } catch (error) { setStatus(error instanceof Error ? error.message : "Index build failed"); } finally { setBusy(false); } };
+  return <div className="modal-backdrop"><div className="modal settings-modal" role="dialog" aria-modal="true"><div className="modal-header"><div><h2>Provider settings</h2><p>Saved to config.toml. Environment variables override these values.</p></div><button className="icon-button" onClick={onClose}>×</button></div>
+    <fieldset><legend>Chat provider</legend><label>Base URL<input value={value.provider.base_url} onChange={(event) => changeProvider("base_url", event.target.value)} /></label><label>Model<input value={value.provider.model} onChange={(event) => changeProvider("model", event.target.value)} /></label><label>Timeout<input value={value.provider.timeout} onChange={(event) => changeProvider("timeout", event.target.value)} /></label><KeyFields settings={value.provider} change={changeProvider} /><button onClick={() => void test("provider")} disabled={busy}>Test chat connection</button></fieldset>
+    <fieldset><legend>Embedding provider</legend><label>Base URL<input value={value.embedding.base_url} onChange={(event) => changeEmbedding("base_url", event.target.value)} /></label><label>Model<input value={value.embedding.model} onChange={(event) => changeEmbedding("model", event.target.value)} /></label><div className="settings-grid"><label>Dimensions<input type="number" value={value.embedding.dimensions} onChange={(event) => changeEmbedding("dimensions", Number(event.target.value))} /></label><label>Batch size<input type="number" value={value.embedding.batch_size} onChange={(event) => changeEmbedding("batch_size", Number(event.target.value))} /></label></div><label>Query instruction<textarea value={value.embedding.query_instruction} onChange={(event) => changeEmbedding("query_instruction", event.target.value)} /></label><KeyFields settings={value.embedding} change={changeEmbedding} /><button onClick={() => void test("embedding")} disabled={busy}>Test embedding connection</button></fieldset>
+    {value.environment_overrides.length > 0 && <p className="settings-warning">Environment overrides: {value.environment_overrides.join(", ")}</p>}
+    <div className="index-status"><strong>Vector index</strong><span>{index?.complete ? `${index.indexed}/${index.total} chunks indexed` : `Stale · ${index?.indexed || 0}/${index?.total || 0}`}</span><button onClick={() => void build()} disabled={busy}>Build embeddings</button></div>
+    {status && <p className="modal-status">{status}</p>}<div className="modal-footer"><span>Keys are never returned by the API.</span><button onClick={() => void save()} disabled={busy}>Save settings</button></div>
+  </div></div>;
+}
+
+function KeyFields({ settings, change }: { settings: { api_key?: string; api_key_set: boolean; api_key_action?: string }; change(field: string, value: string): void }) {
+  return <div className="key-fields"><label>API key action<select value={settings.api_key_action || "preserve"} onChange={(event) => change("api_key_action", event.target.value)}><option value="preserve">Preserve {settings.api_key_set ? "saved key" : "empty key"}</option><option value="replace">Replace key</option><option value="clear">Clear key</option></select></label>{settings.api_key_action === "replace" && <label>New API key<input type="password" value={settings.api_key || ""} onChange={(event) => change("api_key", event.target.value)} /></label>}</div>;
 }
 
 function ImportDialog({ onClose, onImported }: { onClose(): void; onImported(): Promise<void> }) {

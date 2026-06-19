@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	dogearadapter "github.com/sumedho/dogear/internal/adapters/dogear"
 	"github.com/sumedho/dogear/internal/app"
 	"github.com/sumedho/dogear/internal/dogear"
+	"github.com/sumedho/dogear/internal/embedding"
+	"github.com/sumedho/dogear/internal/evaluation"
 	"github.com/sumedho/dogear/internal/logging"
 	"github.com/sumedho/dogear/internal/server"
 )
@@ -90,6 +93,7 @@ func newRootCommandWithOptions(out, errOut io.Writer) (*cobra.Command, *rootOpti
 	root.AddCommand(newShowCommand(&opts))
 	root.AddCommand(newContextCommand(&opts))
 	root.AddCommand(newDoctorCommand(&opts))
+	root.AddCommand(newEvalCommand(&opts))
 	root.AddCommand(newAskCommand(&opts))
 	root.AddCommand(newServeCommand(&opts))
 	root.AddCommand(notImplementedCommand("convert", "Convert source documents to Markdown"))
@@ -104,6 +108,109 @@ func newRootCommandWithOptions(out, errOut io.Writer) (*cobra.Command, *rootOpti
 	}
 
 	return root, &opts
+}
+
+func newEvalCommand(opts *rootOptions) *cobra.Command {
+	var mode string
+	var ks []int
+	var answers, jsonOut bool
+	var minRecall, minMRR float64
+	cmd := &cobra.Command{Use: "eval FIXTURE", Short: "Evaluate retrieval and citation quality", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		fixture, err := evaluation.Load(args[0])
+		if err != nil {
+			return err
+		}
+		if mode != "fts" && mode != "hybrid" && mode != "both" {
+			return fmt.Errorf("mode must be fts, hybrid, or both")
+		}
+		store, err := openStore(opts)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		if err := store.Init(); err != nil {
+			return err
+		}
+		configPath := resolveConfigPath(opts.configPath)
+		provider, err := app.ProviderConfig(configPath, app.ProviderOverride{})
+		if err != nil {
+			return err
+		}
+		embedConfig, err := embedding.Resolve(configPath, provider.BaseURL, provider.APIKey)
+		if err != nil {
+			return err
+		}
+		embedClient, _ := embedding.NewClient(embedConfig)
+		retrieve := func(ctx context.Context, selected string, item evaluation.Case, limit int) (dogear.RetrievalResult, error) {
+			retrieveOpts := dogear.RetrieveOptions{Query: item.Query, DocumentID: item.DocumentID, Limit: limit}
+			if selected == "hybrid" {
+				if embedClient == nil {
+					return dogear.RetrievalResult{}, fmt.Errorf("embedding model is not configured")
+				}
+				status, err := store.EmbeddingStatus(ctx, embedConfig.Model, embedConfig.Dimensions, embedConfig.IndexHash())
+				if err != nil {
+					return dogear.RetrievalResult{}, err
+				}
+				if !status.Complete {
+					return dogear.RetrievalResult{}, fmt.Errorf("embedding index is stale; run dogear index --embeddings")
+				}
+				vector, err := embedClient.EmbedQuery(ctx, item.Query)
+				if err != nil {
+					return dogear.RetrievalResult{}, err
+				}
+				return store.RetrieveHybrid(ctx, retrieveOpts, vector)
+			}
+			return store.Retrieve(ctx, retrieveOpts)
+		}
+		var answer evaluation.AnswerFunc
+		if answers {
+			answer = func(ctx context.Context, selected string, item evaluation.Case) (string, error) {
+				var retriever app.Retriever
+				if selected == "hybrid" {
+					value := dogearadapter.NewConfiguredRetriever(store, configPath)
+					retriever = value
+				} else {
+					value := dogearadapter.NewRetriever(store)
+					retriever = value
+				}
+				result, err := app.Ask(ctx, retriever, app.AskOptions{Question: item.Query, DocumentID: item.DocumentID, ConfigPath: configPath})
+				return result.Answer, err
+			}
+		}
+		modes := []string{mode}
+		if mode == "both" {
+			modes = []string{"fts", "hybrid"}
+		}
+		reports := make([]evaluation.Report, 0, len(modes))
+		failed := false
+		for _, selected := range modes {
+			report := evaluation.Run(cmd.Context(), fixture, selected, ks, retrieve, answer)
+			reports = append(reports, report)
+			if report.MRR < minMRR || report.RecallAt[5] < minRecall {
+				failed = true
+			}
+		}
+		if jsonOut {
+			if err := writeJSON(opts.out, reports); err != nil {
+				return err
+			}
+		} else {
+			for _, report := range reports {
+				fmt.Fprintf(opts.out, "%s: MRR %.3f Recall@5 %.3f nDCG@5 %.3f latency %.1fms\n", report.Mode, report.MRR, report.RecallAt[5], report.NDCGAt[5], report.AverageLatencyMS)
+			}
+		}
+		if failed {
+			return fmt.Errorf("evaluation thresholds not met")
+		}
+		return nil
+	}}
+	cmd.Flags().StringVar(&mode, "mode", "both", "retrieval mode: fts, hybrid, both")
+	cmd.Flags().IntSliceVar(&ks, "k", []int{1, 3, 5}, "ranking cutoffs")
+	cmd.Flags().BoolVar(&answers, "answers", false, "also evaluate answer terms and citation validity")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "write JSON output")
+	cmd.Flags().Float64Var(&minRecall, "min-recall-at-5", 0, "minimum Recall@5 threshold")
+	cmd.Flags().Float64Var(&minMRR, "min-mrr", 0, "minimum MRR threshold")
+	return cmd
 }
 
 func (opts *rootOptions) closeLogger() {
@@ -168,6 +275,7 @@ type chunkJSON struct {
 }
 
 type sourceRefJSON struct {
+	ChunkID     int64          `json:"chunk_id"`
 	Label       string         `json:"label"`
 	DocumentID  string         `json:"document_id"`
 	Title       string         `json:"title"`
@@ -182,10 +290,16 @@ type sourceRefJSON struct {
 }
 
 type rankDebugJSON struct {
-	RawScore    float64  `json:"raw_score"`
-	RerankScore float64  `json:"rerank_score"`
-	Quality     string   `json:"quality"`
-	Reasons     []string `json:"reasons"`
+	RawScore       float64  `json:"raw_score"`
+	RerankScore    float64  `json:"rerank_score"`
+	Quality        string   `json:"quality"`
+	Reasons        []string `json:"reasons"`
+	Mode           string   `json:"mode,omitempty"`
+	FTSRank        int      `json:"fts_rank,omitempty"`
+	VectorRank     int      `json:"vector_rank,omitempty"`
+	VectorDistance float64  `json:"vector_distance,omitempty"`
+	FusedScore     float64  `json:"fused_score,omitempty"`
+	FallbackReason string   `json:"fallback_reason,omitempty"`
 }
 
 type contextBlockJSON struct {
@@ -299,6 +413,7 @@ func retrievalResultResponse(result dogear.RetrievalResult, includeDebug bool) r
 
 func sourceRefResponse(source dogear.SourceRef, includeDebug bool) sourceRefJSON {
 	return sourceRefJSON{
+		ChunkID:     source.ChunkID,
 		Label:       source.Label,
 		DocumentID:  source.DocumentID,
 		Title:       source.Title,
@@ -322,6 +437,8 @@ func rankDebugResponse(debug dogear.RankDebug, include bool) *rankDebugJSON {
 		RerankScore: debug.RerankScore,
 		Quality:     debug.Quality,
 		Reasons:     debug.Reasons,
+		Mode:        debug.Mode, FTSRank: debug.FTSRank, VectorRank: debug.VectorRank,
+		VectorDistance: debug.VectorDistance, FusedScore: debug.FusedScore, FallbackReason: debug.FallbackReason,
 	}
 }
 
@@ -465,7 +582,7 @@ func newInitCommand(opts *rootOptions) *cobra.Command {
 				if !os.IsNotExist(err) {
 					return err
 				}
-				if err := os.WriteFile(configPath, []byte(defaultConfigTOML()), 0o644); err != nil {
+				if err := os.WriteFile(configPath, []byte(defaultConfigTOML()), 0o600); err != nil {
 					return err
 				}
 			}
@@ -481,6 +598,15 @@ base_url = "http://localhost:11434/v1"
 model = ""
 api_key = ""
 timeout = "60s"
+
+[embedding]
+base_url = "http://localhost:8000/v1"
+model = ""
+api_key = ""
+dimensions = 1024
+batch_size = 16
+query_instruction = "Retrieve relevant passages from product manuals that answer the user's question."
+timeout = "120s"
 `
 }
 
@@ -522,7 +648,9 @@ func newImportCommand(opts *rootOptions) *cobra.Command {
 }
 
 func newIndexCommand(opts *rootOptions) *cobra.Command {
-	return &cobra.Command{
+	var embeddings bool
+	var force bool
+	cmd := &cobra.Command{
 		Use:   "index",
 		Short: "Rebuild the SQLite FTS5 index",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -531,14 +659,42 @@ func newIndexCommand(opts *rootOptions) *cobra.Command {
 				return err
 			}
 			defer store.Close()
+			if err := store.Init(); err != nil {
+				return err
+			}
 			count, err := store.RebuildIndex(cmd.Context())
 			if err != nil {
 				return err
 			}
 			fmt.Fprintf(opts.out, "indexed %d chunk(s)\n", count)
+			if embeddings {
+				provider, err := app.ProviderConfig(resolveConfigPath(opts.configPath), app.ProviderOverride{})
+				if err != nil {
+					return err
+				}
+				config, err := embedding.Resolve(resolveConfigPath(opts.configPath), provider.BaseURL, provider.APIKey)
+				if err != nil {
+					return err
+				}
+				client, err := embedding.NewClient(config)
+				if err != nil {
+					return err
+				}
+				status, err := store.BuildEmbeddingIndex(cmd.Context(), config.Model, config.Dimensions, config.BatchSize, config.IndexHash(), force, client.Embed, func(indexed, total int) {
+					fmt.Fprintf(opts.errOut, "embedding %d/%d chunks\r", indexed, total)
+				})
+				fmt.Fprintln(opts.errOut)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(opts.out, "embedded %d chunk(s) with %s (%d dimensions)\n", status.Indexed, status.Model, status.Dimensions)
+			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&embeddings, "embeddings", false, "build the configured vector index")
+	cmd.Flags().BoolVar(&force, "force", false, "rebuild embeddings even when the index is current")
+	return cmd
 }
 
 func newListCommand(opts *rootOptions) *cobra.Command {
@@ -647,7 +803,8 @@ func newSearchCommand(opts *rootOptions) *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			results, err := store.Search(cmd.Context(), dogear.SearchOptions{
+			retriever := dogearadapter.NewConfiguredRetriever(store, resolveConfigPath(opts.configPath))
+			results, err := retriever.SearchRaw(cmd.Context(), dogear.SearchOptions{
 				Query:      args[0],
 				DocumentID: docID,
 				Limit:      limit,
@@ -735,7 +892,8 @@ func newContextCommand(opts *rootOptions) *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			result, err := store.Retrieve(cmd.Context(), dogear.RetrieveOptions{
+			retriever := dogearadapter.NewConfiguredRetriever(store, resolveConfigPath(opts.configPath))
+			result, err := retriever.RetrieveRaw(cmd.Context(), dogear.RetrieveOptions{
 				Query:      args[0],
 				DocumentID: docID,
 				Limit:      limit,
@@ -809,7 +967,7 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 					Timeout: timeoutValue,
 				},
 			}
-			retriever := dogearadapter.NewRetriever(store)
+			retriever := dogearadapter.NewConfiguredRetriever(store, resolveConfigPath(opts.configPath))
 			if !dryRun && !jsonOut {
 				result, err := app.AskStream(cmd.Context(), retriever, askOptions, func(delta string) error {
 					_, err := fmt.Fprint(opts.out, delta)

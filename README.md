@@ -109,6 +109,33 @@ base_url = "http://localhost:11434/v1"
 model = "llama3.1"
 api_key = ""
 timeout = "60s"
+
+[embedding]
+base_url = "http://localhost:8000/v1"
+model = "Qwen3-Embedding-8B-4bit-DWQ"
+api_key = ""
+dimensions = 1024
+batch_size = 16
+query_instruction = "Retrieve relevant passages from product manuals that answer the user's question."
+timeout = "120s"
+```
+
+Build the optional sqlite-vec index explicitly:
+
+```sh
+./dogear index --embeddings
+```
+
+Search, context, ask, and the web API use hybrid FTS/vector retrieval when the
+embedding index is current. They fall back to FTS when it is missing, stale, or
+the embedding endpoint is unavailable. Imports mark the vector index stale.
+
+Retrieval evaluation fixtures are JSON files containing queries and expected
+heading/page/text selectors. Compare modes with:
+
+```sh
+./dogear eval evaluation.json --mode both
+./dogear eval evaluation.json --mode hybrid --answers --json
 ```
 
 Local-first defaults target Ollama-style endpoints, so this is enough for many local setups:
@@ -175,6 +202,10 @@ The web UI keeps chats in browser storage, supports a manual per chat (or all
 manuals), streams answers, and can import `.md` or `.markdown` files. Embedded
 base64 PNG, JPEG, GIF, and WebP images are stored outside the search index and
 shown with relevant retrieved sources.
+
+Citation cards open a deep-linked manual viewer at the retrieved chunk. The
+Settings panel edits masked chat/embedding configuration, tests both endpoints,
+shows vector-index coverage, and streams explicit embedding rebuild progress.
 
 The streaming endpoint uses server-sent events:
 

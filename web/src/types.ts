@@ -17,6 +17,7 @@ export interface ImageRef {
 }
 
 export interface SourceRef {
+  chunk_id: number;
   label: string;
   document_id: string;
   title: string;
@@ -66,3 +67,13 @@ export interface Chat {
   createdAt: number;
   updatedAt: number;
 }
+
+export interface DocumentChunk {
+  id: number; document_id: string; ordinal: number; heading_path: string; heading_level: number;
+  page_number: number | null; start_line: number; end_line: number; text: string; images?: ImageRef[];
+}
+
+export interface ProviderSettings { base_url: string; model: string; timeout: string; api_key?: string; api_key_set: boolean; api_key_action?: string; }
+export interface EmbeddingSettings extends ProviderSettings { dimensions: number; batch_size: number; query_instruction: string; }
+export interface Settings { provider: ProviderSettings; embedding: EmbeddingSettings; environment_overrides: string[]; }
+export interface EmbeddingIndexStatus { configured: boolean; complete: boolean; stale: boolean; model: string; dimensions: number; indexed: number; total: number; updated_at?: string; }
