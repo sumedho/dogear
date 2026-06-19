@@ -10,15 +10,15 @@ import (
 )
 
 type Retriever struct {
-	store      *dogear.Store
+	store      dogear.RetrievalStore
 	configPath string
 }
 
-func NewRetriever(store *dogear.Store) Retriever {
+func NewRetriever(store dogear.RetrievalStore) Retriever {
 	return Retriever{store: store}
 }
 
-func NewConfiguredRetriever(store *dogear.Store, configPath string) Retriever {
+func NewConfiguredRetriever(store dogear.RetrievalStore, configPath string) Retriever {
 	return Retriever{store: store, configPath: configPath}
 }
 
