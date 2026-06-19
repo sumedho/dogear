@@ -24,7 +24,10 @@ export function listDocumentChunks(documentId: string, after = 0): Promise<Docum
 export function getDocumentChunk(documentId: string, chunkId: number): Promise<DocumentChunk> {
   return json(`/api/documents/${encodeURIComponent(documentId)}/chunks/${chunkId}`);
 }
-export function getSettings(): Promise<Settings> { return json("/api/settings"); }
+export async function getSettings(): Promise<Settings> {
+  const settings = await json<Settings>("/api/settings");
+  return { ...settings, environment_overrides: settings.environment_overrides ?? [] };
+}
 export function saveSettings(settings: Settings): Promise<Settings> { return json("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(settings) }); }
 export function testSettings(target: "provider" | "embedding"): Promise<{ ok: boolean; model: string; dimensions?: number }> { return json("/api/settings/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }) }); }
 export function embeddingIndexStatus(): Promise<EmbeddingIndexStatus> { return json("/api/index/embeddings/status"); }

@@ -1,5 +1,19 @@
-import { describe, expect, it } from "vitest";
-import { SSEParser } from "./api";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getSettings, SSEParser } from "./api";
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("getSettings", () => {
+  it("normalizes null environment overrides from older servers", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      provider: {},
+      embedding: {},
+      environment_overrides: null,
+    }), { status: 200 })));
+
+    await expect(getSettings()).resolves.toMatchObject({ environment_overrides: [] });
+  });
+});
 
 describe("SSEParser", () => {
   it("parses events split across transport chunks", () => {

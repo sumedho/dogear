@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sumedho/dogear/internal/sqlutil"
 	_ "modernc.org/sqlite"
 	_ "modernc.org/sqlite/vec"
 )
@@ -327,7 +328,7 @@ func (s *Store) UpsertDocumentWithImages(ctx context.Context, doc Document, chun
 	for _, chunk := range chunks {
 		result, insertErr := tx.ExecContext(ctx, `INSERT INTO chunks(document_id, ordinal, heading_path, heading_level, page_number, start_line, end_line, text, text_hash)
 			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			doc.ID, chunk.Ordinal, chunk.HeadingPath, chunk.HeadingLevel, nullInt(chunk.PageNumber), chunk.StartLine, chunk.EndLine, chunk.Text, chunk.TextHash)
+			doc.ID, chunk.Ordinal, chunk.HeadingPath, chunk.HeadingLevel, sqlutil.Int64Value(chunk.PageNumber), chunk.StartLine, chunk.EndLine, chunk.Text, chunk.TextHash)
 		if insertErr != nil {
 			return insertErr
 		}
@@ -1048,13 +1049,6 @@ func (s *Store) BuildEmbeddingIndex(ctx context.Context, model string, dimension
 
 func now() string {
 	return time.Now().UTC().Format(time.RFC3339)
-}
-
-func nullInt(value sql.NullInt64) any {
-	if !value.Valid {
-		return nil
-	}
-	return value.Int64
 }
 
 func scanDocumentInfos(rows *sql.Rows) ([]DocumentInfo, error) {

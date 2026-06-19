@@ -1,9 +1,8 @@
 package server
 
 import (
-	"database/sql"
-
 	"github.com/sumedho/dogear/internal/dogear"
+	"github.com/sumedho/dogear/internal/sqlutil"
 )
 
 type documentInfoResponse struct {
@@ -105,7 +104,7 @@ func documentChunkResponseFor(chunk dogear.DocumentChunk) documentChunkResponse 
 		images = append(images, imageRefResponse{ID: image.ID, Alt: image.Alt, MediaType: image.MediaType})
 	}
 	return documentChunkResponse{ID: chunk.ID, DocumentID: chunk.DocumentID, Ordinal: chunk.Ordinal, HeadingPath: chunk.HeadingPath,
-		HeadingLevel: chunk.HeadingLevel, PageNumber: nullIntPtr(chunk.PageNumber), StartLine: chunk.StartLine, EndLine: chunk.EndLine, Text: chunk.Text, Images: images}
+		HeadingLevel: chunk.HeadingLevel, PageNumber: sqlutil.Int64Ptr(chunk.PageNumber), StartLine: chunk.StartLine, EndLine: chunk.EndLine, Text: chunk.Text, Images: images}
 }
 
 func documentInfoResponses(infos []dogear.DocumentInfo) []documentInfoResponse {
@@ -134,7 +133,7 @@ func searchResultResponses(results []dogear.SearchResult, includeDebug bool) []s
 	for _, result := range results {
 		out = append(out, searchResultResponse{
 			DocumentID: result.DocumentID, Title: result.Title, HeadingPath: result.HeadingPath,
-			PageNumber: nullIntPtr(result.PageNumber), StartLine: result.StartLine, EndLine: result.EndLine,
+			PageNumber: sqlutil.Int64Ptr(result.PageNumber), StartLine: result.StartLine, EndLine: result.EndLine,
 			Snippet: result.Snippet, Score: result.Score, Debug: rankDebugResponseFor(result.Debug, includeDebug),
 		})
 	}
@@ -156,7 +155,7 @@ func sourceRefResponseFor(source dogear.SourceRef, includeDebug bool) sourceRefR
 	return sourceRefResponse{
 		ChunkID: source.ChunkID, Label: source.Label, DocumentID: source.DocumentID, Title: source.Title,
 		Brand: source.Brand, Model: source.Model, HeadingPath: source.HeadingPath,
-		PageNumber: nullIntPtr(source.PageNumber), StartLine: source.StartLine, EndLine: source.EndLine,
+		PageNumber: sqlutil.Int64Ptr(source.PageNumber), StartLine: source.StartLine, EndLine: source.EndLine,
 		Score: source.Score, Debug: rankDebugResponseFor(source.Debug, includeDebug),
 	}
 }
@@ -171,11 +170,4 @@ func rankDebugResponseFor(debug dogear.RankDebug, include bool) *rankDebugRespon
 		FTSRank: debug.FTSRank, VectorRank: debug.VectorRank, VectorDistance: debug.VectorDistance,
 		FusedScore: debug.FusedScore, FallbackReason: debug.FallbackReason,
 	}
-}
-
-func nullIntPtr(value sql.NullInt64) *int64 {
-	if !value.Valid {
-		return nil
-	}
-	return &value.Int64
 }

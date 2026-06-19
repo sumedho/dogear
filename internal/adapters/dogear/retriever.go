@@ -2,11 +2,11 @@ package dogearadapter
 
 import (
 	"context"
-	"database/sql"
 
 	"github.com/sumedho/dogear/internal/app"
 	"github.com/sumedho/dogear/internal/dogear"
 	"github.com/sumedho/dogear/internal/embedding"
+	"github.com/sumedho/dogear/internal/sqlutil"
 )
 
 type Retriever struct {
@@ -142,7 +142,7 @@ func retrievalResult(result dogear.RetrievalResult) app.RetrievalResult {
 				Brand:       block.Source.Brand,
 				Model:       block.Source.Model,
 				HeadingPath: block.Source.HeadingPath,
-				PageNumber:  nullInt64Ptr(block.Source.PageNumber),
+				PageNumber:  sqlutil.Int64Ptr(block.Source.PageNumber),
 				StartLine:   block.Source.StartLine,
 				EndLine:     block.Source.EndLine,
 				Score:       block.Source.Score,
@@ -152,11 +152,4 @@ func retrievalResult(result dogear.RetrievalResult) app.RetrievalResult {
 		})
 	}
 	return out
-}
-
-func nullInt64Ptr(value sql.NullInt64) *int64 {
-	if !value.Valid {
-		return nil
-	}
-	return &value.Int64
 }

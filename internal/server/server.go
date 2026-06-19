@@ -204,6 +204,7 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 	payload := settingsPayload{
 		Provider:  settingsProviderPayload{BaseURL: values.Provider.BaseURL, Model: values.Provider.Model, Timeout: values.Provider.Timeout.String(), APIKeySet: values.Provider.APIKey != ""},
 		Embedding: settingsEmbeddingPayload{settingsProviderPayload: settingsProviderPayload{BaseURL: values.Embedding.BaseURL, Model: values.Embedding.Model, Timeout: values.Embedding.Timeout.String(), APIKeySet: values.Embedding.APIKey != ""}, Dimensions: values.Embedding.Dimensions, BatchSize: values.Embedding.BatchSize, QueryInstruction: values.Embedding.QueryInstruction},
+		Overrides: make([]string, 0),
 	}
 	for _, key := range []string{"DOGEAR_BASE_URL", "DOGEAR_API_KEY", "DOGEAR_MODEL", "DOGEAR_TIMEOUT", "DOGEAR_EMBEDDING_BASE_URL", "DOGEAR_EMBEDDING_API_KEY", "DOGEAR_EMBEDDING_MODEL", "DOGEAR_EMBEDDING_DIMENSIONS", "DOGEAR_EMBEDDING_BATCH_SIZE"} {
 		if _, ok := os.LookupEnv(key); ok {

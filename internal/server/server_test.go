@@ -77,6 +77,9 @@ timeout = "120s"
 	if !strings.Contains(response.Body.String(), `"api_key_set":true`) {
 		t.Fatalf("missing masked key state: %s", response.Body.String())
 	}
+	if strings.Contains(response.Body.String(), `"environment_overrides":null`) {
+		t.Fatalf("environment overrides must be an array: %s", response.Body.String())
+	}
 	var payload settingsPayload
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
