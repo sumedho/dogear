@@ -128,6 +128,10 @@ func retrievalResult(result dogear.RetrievalResult) app.RetrievalResult {
 		Query:  result.Query,
 		Blocks: make([]app.ContextBlock, 0, len(result.Blocks)),
 	}
+	if len(result.Blocks) > 0 {
+		out.Mode = result.Blocks[0].Source.Debug.Mode
+		out.FallbackReason = result.Blocks[0].Source.Debug.FallbackReason
+	}
 	for _, block := range result.Blocks {
 		images := make([]app.ImageRef, 0, len(block.Images))
 		for _, image := range block.Images {

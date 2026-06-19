@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getSettings, importMarkdown, loadDocumentChunks, removeDocument, SSEParser } from "./api";
+import { getSettings, importMarkdown, loadDocumentChunks, removeDocument, searchManual, SSEParser } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -31,6 +31,15 @@ describe("removeDocument", () => {
     vi.stubGlobal("fetch", fetchMock);
     await removeDocument("manual/one");
     expect(fetchMock).toHaveBeenCalledWith("/api/documents/manual%2Fone", { method: "DELETE" });
+  });
+});
+
+describe("searchManual", () => {
+  it("scopes search to the selected manual and returns chunk IDs", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify([{ chunk_id: 42, document_id: "manual/one" }]), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(searchManual("local control", "manual/one")).resolves.toMatchObject([{ chunk_id: 42 }]);
+    expect(fetchMock).toHaveBeenCalledWith("/api/search?q=local+control&doc=manual%2Fone&limit=20", undefined);
   });
 });
 

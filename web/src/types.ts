@@ -42,7 +42,21 @@ export interface ContextBlock {
 
 export interface RetrievalResult {
   query: string;
+  mode?: "fts" | "hybrid" | string;
+  fallback_reason?: string;
   blocks: ContextBlock[];
+}
+
+export interface SearchResult {
+  chunk_id: number;
+  document_id: string;
+  title: string;
+  heading_path: string;
+  page_number: number | null;
+  start_line: number;
+  end_line: number;
+  snippet: string;
+  score: number;
 }
 
 export interface AskResult {

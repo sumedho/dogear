@@ -256,6 +256,9 @@ func TestImportAndServeEmbeddedImage(t *testing.T) {
 	if len(searchResults) != 1 || len(searchResults[0].Images) != 1 || searchResults[0].Images[0].Alt != "Signal flow schematic" {
 		t.Fatalf("unexpected image search response: %#v", searchResults)
 	}
+	if searchResults[0].ChunkID <= 0 {
+		t.Fatalf("search result does not include a deep-linkable chunk id: %#v", searchResults[0])
+	}
 	contextRequest := httptest.NewRequest(http.MethodGet, "/api/context?q=signal+flow+schematic&doc=images", nil)
 	contextResponse := httptest.NewRecorder()
 	handler.ServeHTTP(contextResponse, contextRequest)

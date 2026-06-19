@@ -1,4 +1,4 @@
-import type { AskResult, DocumentChunk, DocumentHealth, DocumentImportWarning, DocumentInfo, EmbeddingIndexStatus, Settings } from "./types";
+import type { AskResult, DocumentChunk, DocumentHealth, DocumentImportWarning, DocumentInfo, EmbeddingIndexStatus, SearchResult, Settings } from "./types";
 
 async function json<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, options);
@@ -17,6 +17,11 @@ export function removeDocument(documentId: string): Promise<{ ok: boolean }> {
 
 export function documentHealth(documentId: string): Promise<DocumentHealth> {
   return json(`/api/documents/${encodeURIComponent(documentId)}/health`);
+}
+
+export function searchManual(query: string, documentId: string, limit = 20): Promise<SearchResult[]> {
+  const params = new URLSearchParams({ q: query, doc: documentId, limit: String(limit) });
+  return json(`/api/search?${params}`);
 }
 
 export interface ImportMetadata { id: string; brand: string; model: string; tags: string; }

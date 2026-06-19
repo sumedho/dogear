@@ -86,8 +86,10 @@ type DisplayImage struct {
 }
 
 type RetrievalResult struct {
-	Query  string         `json:"query"`
-	Blocks []ContextBlock `json:"blocks"`
+	Query          string         `json:"query"`
+	Mode           string         `json:"mode,omitempty"`
+	FallbackReason string         `json:"fallback_reason,omitempty"`
+	Blocks         []ContextBlock `json:"blocks"`
 }
 
 type AskResponse struct {

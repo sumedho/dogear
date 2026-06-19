@@ -16,6 +16,7 @@ func TestRetrievalResult(t *testing.T) {
 					Label: "[1]", DocumentID: "doc", Title: "Manual", Brand: "Brand", Model: "Model",
 					HeadingPath: "Setup", PageNumber: sql.NullInt64{Int64: 4, Valid: true},
 					StartLine: 3, EndLine: 8, Score: -1.25,
+					Debug: dogear.RankDebug{Mode: "fts", FallbackReason: "embedding unavailable"},
 				},
 				Text: "first",
 			},
@@ -28,6 +29,9 @@ func TestRetrievalResult(t *testing.T) {
 
 	if result.Query != "question" || len(result.Blocks) != 2 {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+	if result.Mode != "fts" || result.FallbackReason != "embedding unavailable" {
+		t.Fatalf("retrieval metadata = mode %q fallback %q", result.Mode, result.FallbackReason)
 	}
 	first := result.Blocks[0]
 	if first.Source.PageNumber == nil || *first.Source.PageNumber != 4 || first.Source.Brand != "Brand" || first.Source.Score != -1.25 {

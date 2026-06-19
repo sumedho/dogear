@@ -22,6 +22,7 @@ type documentInfoResponse struct {
 }
 
 type searchResultResponse struct {
+	ChunkID     int64              `json:"chunk_id"`
 	DocumentID  string             `json:"document_id"`
 	Title       string             `json:"title"`
 	HeadingPath string             `json:"heading_path"`
@@ -131,7 +132,7 @@ func searchResultResponses(results []dogear.SearchResult, includeDebug bool) []s
 	out := make([]searchResultResponse, 0, len(results))
 	for _, result := range results {
 		out = append(out, searchResultResponse{
-			DocumentID: result.DocumentID, Title: result.Title, HeadingPath: result.HeadingPath,
+			ChunkID: result.ChunkID, DocumentID: result.DocumentID, Title: result.Title, HeadingPath: result.HeadingPath,
 			PageNumber: sqlutil.Int64Ptr(result.PageNumber), StartLine: result.StartLine, EndLine: result.EndLine,
 			Snippet: result.Snippet, Images: imageRefResponses(result.Images), Score: result.Score, Debug: rankDebugResponseFor(result.Debug, includeDebug),
 		})

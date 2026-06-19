@@ -1,9 +1,40 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { buildEmbeddingIndex, documentHealth, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, removeDocument as removeDocumentAPI, saveSettings, streamAsk, testSettings } from "./api";
+import { buildEmbeddingIndex, documentHealth, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, removeDocument as removeDocumentAPI, saveSettings, searchManual, streamAsk, testSettings } from "./api";
 import { loadChats, newChat, saveChats } from "./storage";
-import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentHealth, DocumentInfo, EmbeddingIndexStatus, Settings, SourceRef } from "./types";
+import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentHealth, DocumentInfo, EmbeddingIndexStatus, SearchResult, Settings, SourceRef } from "./types";
+
+function useDialog<T extends HTMLElement>(onClose: () => void, canClose = true) {
+  const ref = useRef<T>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const dialog = ref.current;
+    const focusable = () => Array.from(dialog?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])') || []);
+    requestAnimationFrame(() => focusable()[0]?.focus());
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && canClose) { event.preventDefault(); onCloseRef.current(); return; }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) return;
+      const first = items[0]; const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    window.addEventListener("keydown", keydown);
+    return () => { window.removeEventListener("keydown", keydown); previous?.focus(); };
+  }, [canClose]);
+  return ref;
+}
+
+type Toast = { message: string; action?: { label: string; run(): void } };
+
+function previousUserIndex(messages: ChatMessage[], before: number): number {
+  for (let index = before - 1; index >= 0; index--) if (messages[index].role === "user") return index;
+  return -1;
+}
 
 function sourceDescription(source: SourceRef): string {
   const parts = [source.title];
@@ -77,7 +108,8 @@ export default function App() {
   const [loadingDocs, setLoadingDocs] = useState(true);
   const [docsError, setDocsError] = useState("");
   const [controller, setController] = useState<AbortController | null>(null);
-  const endRef = useRef<HTMLDivElement>(null);
+  const [toast, setToast] = useState<Toast | null>(null);
+  const messagesRef = useRef<HTMLElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const cancelRenameRef = useRef(false);
   const current = chats.find((chat) => chat.id === activeId) || chats[0];
@@ -100,7 +132,12 @@ export default function App() {
 		restore(); window.addEventListener("hashchange", restore); return () => window.removeEventListener("hashchange", restore);
 	}, []);
   useEffect(() => saveChats(chats), [chats]);
-  useEffect(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), [current?.messages]);
+  useEffect(() => {
+    const messages = messagesRef.current;
+    if (messages) messages.scrollTo({ top: messages.scrollHeight, behavior: "smooth" });
+    if (window.scrollY) window.scrollTo(0, 0);
+  }, [current?.messages]);
+  useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(null), 5000); return () => clearTimeout(timer); }, [toast]);
 
   const updateChat = (chatId: string, update: (chat: Chat) => Chat) => {
     setChats((items) => items.map((chat) => (chat.id === chatId ? update(chat) : chat)));
@@ -135,6 +172,27 @@ export default function App() {
     setEditingChat(null);
   };
 
+  const runAnswer = async (chat: Chat, question: string, history: Array<{ role: string; content: string }>, assistantId: string) => {
+    if (controller) return;
+    const abort = new AbortController();
+    setController(abort);
+    try {
+      await streamAsk(
+        { question, doc: chat.documentId, limit: 8, history },
+        {
+          onDelta: (content) => updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, content: message.content + content } : message), updatedAt: Date.now() })),
+          onResult: (result: AskResult) => updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, content: result.answer, status: "done", sources: result.sources, retrieval: result.retrieval, images: result.images, error: undefined } : message), updatedAt: Date.now() })),
+        },
+        abort.signal,
+      );
+    } catch (error) {
+      const cancelled = error instanceof DOMException && error.name === "AbortError";
+      updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, status: cancelled ? "cancelled" : "error", error: cancelled ? "Stopped" : error instanceof Error ? error.message : "Request failed" } : message) }));
+    } finally {
+      setController(null);
+    }
+  };
+
   const send = async () => {
     const question = current.draft.trim();
     if (!question || controller) return;
@@ -152,45 +210,26 @@ export default function App() {
       messages: [...value.messages, userMessage, assistantMessage],
       updatedAt: Date.now(),
     }));
-    const abort = new AbortController();
-    setController(abort);
-    try {
-      await streamAsk(
-        { question, doc: chat.documentId, limit: 8, history },
-        {
-          onDelta: (content) => updateChat(chat.id, (value) => ({
-            ...value,
-            messages: value.messages.map((message) => message.id === assistantId ? { ...message, content: message.content + content } : message),
-            updatedAt: Date.now(),
-          })),
-          onResult: (result: AskResult) => updateChat(chat.id, (value) => ({
-            ...value,
-            messages: value.messages.map((message) => message.id === assistantId ? {
-              ...message,
-              content: result.answer,
-              status: "done",
-              sources: result.sources,
-              retrieval: result.retrieval,
-			  images: result.images,
-            } : message),
-            updatedAt: Date.now(),
-          })),
-        },
-        abort.signal,
-      );
-    } catch (error) {
-      const cancelled = error instanceof DOMException && error.name === "AbortError";
-      updateChat(chat.id, (value) => ({
-        ...value,
-        messages: value.messages.map((message) => message.id === assistantId ? {
-          ...message,
-          status: cancelled ? "cancelled" : "error",
-          error: cancelled ? "Stopped" : error instanceof Error ? error.message : "Request failed",
-        } : message),
-      }));
-    } finally {
-      setController(null);
-    }
+    await runAnswer(chat, question, history, assistantId);
+  };
+
+  const retryAnswer = async (assistantId: string) => {
+    if (controller) return;
+    const assistantIndex = current.messages.findIndex((message) => message.id === assistantId);
+    const userIndex = previousUserIndex(current.messages, assistantIndex);
+    if (userIndex < 0) return;
+    const question = current.messages[userIndex].content;
+    const history = current.messages.slice(0, userIndex).filter((message) => message.content && message.status !== "error" && message.status !== "cancelled").map(({ role, content }) => ({ role, content }));
+    updateChat(current.id, (chat) => ({ ...chat, messages: chat.messages.map((message) => message.id === assistantId ? { ...message, content: "", status: "streaming", error: undefined, sources: undefined, retrieval: undefined, images: undefined } : message), updatedAt: Date.now() }));
+    await runAnswer(current, question, history, assistantId);
+  };
+
+  const editQuestion = (assistantId: string) => {
+    const index = current.messages.findIndex((message) => message.id === assistantId);
+    const userIndex = previousUserIndex(current.messages, index);
+    if (userIndex < 0) return;
+    updateChat(current.id, (chat) => ({ ...chat, draft: current.messages[userIndex].content, updatedAt: Date.now() }));
+    requestAnimationFrame(() => composerRef.current?.focus());
   };
 
   const activeDocument = documents.find((document) => document.id === current.documentId);
@@ -208,7 +247,19 @@ export default function App() {
     setChats((items) => items.map((chat) => chat.documentId === document.id ? { ...chat, documentId: "", updatedAt: Date.now() } : chat));
     if (viewer?.documentId === document.id) closeViewer();
     setDeleteDocument(null);
+    setToast({ message: `Removed ${document.title}` });
   };
+
+  const deleteChatWithUndo = (chat: Chat) => {
+    const previousChats = chats;
+    const previousActiveId = activeId;
+    removeChat(chat.id);
+    setToast({ message: `Deleted “${chat.title}”`, action: { label: "Undo", run: () => { setChats(previousChats); setActiveId(previousActiveId); setToast(null); } } });
+  };
+
+  const suggestedPrompts = activeDocument
+    ? [`How do I get started with the ${activeDocument.model || activeDocument.title}?`, "What are the most important settings?", "Show me the MIDI configuration steps"]
+    : ["Compare the setup instructions across these manuals", "Where is MIDI sync configured?", "Summarize the main troubleshooting steps"];
 
   return (
     <div className="app-shell">
@@ -241,7 +292,7 @@ export default function App() {
 
       <main className="chat-main">
         <header className="topbar">
-          <button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar">☰</button>
+          <button className="sidebar-toggle" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><span aria-hidden="true">☰</span> Menu</button>
           <select value={current.documentId} onChange={(event) => selectDocument(event.target.value)} aria-label="Manual for this chat">
             <option value="">All manuals</option>
             {documents.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}
@@ -249,13 +300,14 @@ export default function App() {
           <span className="topbar-status">{activeDocument ? `${activeDocument.chunk_count} indexed chunks` : documents.length ? `${documents.length} manuals` : "No manuals"}</span>
         </header>
 
-        <section className="messages" aria-live="polite">
+	        <section ref={messagesRef} className="messages">
           {!current.messages.length && (
             <div className="empty-state">
               <div className="empty-logo">D</div>
               <h1>Ask your manuals</h1>
-              <p>{documents.length ? "Choose a manual or search across all of them, then ask a question." : "Import a Markdown manual to get started."}</p>
-              {!documents.length && <button onClick={() => setImportOpen(true)}>Import Markdown</button>}
+              <p>{documents.length ? "Choose a manual or search across all of them, then ask a question." : "Import a Markdown manual, check your provider, and ask your first question."}</p>
+              {!documents.length ? <div className="onboarding-steps"><button onClick={() => setImportOpen(true)}>1. Import Markdown</button><button className="secondary-button" onClick={() => setSettingsOpen(true)}>2. Configure provider</button></div>
+                : <div className="suggested-prompts">{suggestedPrompts.map((prompt) => <button key={prompt} onClick={() => { updateChat(current.id, (chat) => ({ ...chat, draft: prompt })); requestAnimationFrame(() => composerRef.current?.focus()); }}>{prompt}</button>)}</div>}
             </div>
           )}
           {current.messages.map((message) => (
@@ -269,11 +321,18 @@ export default function App() {
 				{message.images && message.images.length > 0 && <AnswerImages images={message.images} onOpen={openViewer} />}
                 {message.status === "streaming" && <span className="streaming-cursor" aria-label="Streaming" />}
                 {message.error && <div className={`message-error ${message.status === "cancelled" ? "muted" : ""}`}>{message.error}</div>}
+                {message.role === "assistant" && message.retrieval?.fallback_reason && <div className="retrieval-note">Used full-text search because hybrid search was unavailable.</div>}
                 {message.sources && message.sources.length > 0 && <SourceCards message={message} onOpen={openViewer} />}
+                {message.role === "assistant" && message.status !== "streaming" && <div className="message-actions">
+                  <button onClick={() => void navigator.clipboard.writeText(message.content)} disabled={!message.content}>Copy answer</button>
+                  <button onClick={() => void retryAnswer(message.id)} disabled={!!controller}>{message.status === "done" ? "Regenerate" : "Retry"}</button>
+                  <button onClick={() => editQuestion(message.id)}>Edit question</button>
+                  {message.status === "error" && <button onClick={() => setSettingsOpen(true)}>Open settings</button>}
+                </div>}
               </div>
             </article>
           ))}
-          <div ref={endRef} />
+          <div className="sr-only" role="status" aria-live="polite">{controller ? "Dogear is generating a response" : ""}</div>
         </section>
 
         <div className="composer-wrap">
@@ -300,13 +359,14 @@ export default function App() {
       </main>
 
       {browseOpen && <ManualDialog documents={documents} loading={loadingDocs} error={docsError} onRefresh={refreshDocuments} onSelect={(id) => { selectDocument(id); setBrowseOpen(false); }} onOpen={(id) => { setBrowseOpen(false); openViewer(id); }} onHealth={(document) => { setBrowseOpen(false); setHealthDocument(document); }} onRemove={(document) => { setBrowseOpen(false); setDeleteDocument(document); }} onClose={() => setBrowseOpen(false)} />}
-      {importOpen && <ImportDialog onClose={() => setImportOpen(false)} onImported={refreshDocuments} />}
-		{settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+      {importOpen && <ImportDialog onClose={() => setImportOpen(false)} onImported={async () => { await refreshDocuments(); setToast({ message: "Manual library updated" }); }} />}
+			{settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onNotify={(message) => setToast({ message })} />}
 		{viewer && <ManualViewer manual={documents.find((item) => item.id === viewer.documentId)} documentId={viewer.documentId} chunkId={viewer.chunkId} onAsk={askAboutSection} onClose={closeViewer} />}
-      {deleteChat && <ConfirmDeleteChat chat={deleteChat} streaming={deleteChat.messages.some((message) => message.status === "streaming")} onCancel={() => setDeleteChat(null)} onConfirm={() => { if (deleteChat.messages.some((message) => message.status === "streaming")) controller?.abort(); removeChat(deleteChat.id); setDeleteChat(null); }} />}
+      {deleteChat && <ConfirmDeleteChat chat={deleteChat} streaming={deleteChat.messages.some((message) => message.status === "streaming")} onCancel={() => setDeleteChat(null)} onConfirm={() => { if (deleteChat.messages.some((message) => message.status === "streaming")) controller?.abort(); deleteChatWithUndo(deleteChat); setDeleteChat(null); }} />}
       {healthDocument && <DocumentHealthDialog document={healthDocument} onClose={() => setHealthDocument(null)} onSettings={() => { setHealthDocument(null); setSettingsOpen(true); }} />}
       {deleteDocument && <ConfirmDeleteDocument document={deleteDocument} onCancel={() => setDeleteDocument(null)} onConfirm={() => removeManual(deleteDocument)} />}
       {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar" />}
+      {toast && <div className="toast" role="status"><span>{toast.message}</span>{toast.action && <button onClick={toast.action.run}>{toast.action.label}</button>}<button className="toast-close" onClick={() => setToast(null)} aria-label="Dismiss notification">×</button></div>}
     </div>
   );
 }
@@ -331,11 +391,14 @@ function SourceCards({ message, onOpen }: { message: ChatMessage; onOpen(documen
         {message.sources?.map((source) => {
           const block = blocks.find((item) => item.source.label === source.label);
           return (
-            <button className="source-card" key={`${source.document_id}-${source.label}`} onClick={() => onOpen(source.document_id, source.chunk_id)}>
-              <div className="source-title"><span>{source.label}</span> {sourceDescription(source)}</div>
-              {block?.text && <p>{block.text}</p>}
-              {block?.images?.map((image) => <img key={image.id} src={`/api/images/${image.id}`} alt={image.alt} loading="lazy" />)}
-            </button>
+            <div className="source-card" key={`${source.document_id}-${source.label}`}>
+              <button className="source-open" onClick={() => onOpen(source.document_id, source.chunk_id)}>
+                <div className="source-title"><span>{source.label}</span> {sourceDescription(source)}</div>
+                {block?.text && <p>{block.text}</p>}
+                {block?.images?.map((image) => <img key={image.id} src={`/api/images/${image.id}`} alt={image.alt} loading="lazy" />)}
+              </button>
+              <button className="copy-citation" onClick={() => void navigator.clipboard.writeText(`${source.label} ${sourceDescription(source)}`)}>Copy citation</button>
+            </div>
           );
         })}
       </div>
@@ -346,16 +409,22 @@ function SourceCards({ message, onOpen }: { message: ChatMessage; onOpen(documen
 function ManualDialog({ documents, loading, error, onRefresh, onSelect, onOpen, onHealth, onRemove, onClose }: {
   documents: DocumentInfo[]; loading: boolean; error: string; onRefresh(): Promise<void>; onSelect(id: string): void; onOpen(id: string): void; onHealth(document: DocumentInfo): void; onRemove(document: DocumentInfo): void; onClose(): void;
 }) {
-  return <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-label="Manual library">
-    <div className="modal-header"><div><h2>Manual library</h2><p>Select the manual used by the current chat.</p></div><button className="icon-button" onClick={onClose}>×</button></div>
+  const dialogRef = useDialog<HTMLDivElement>(onClose);
+  const [filter, setFilter] = useState("");
+  const normalized = filter.trim().toLowerCase();
+  const visible = documents.filter((document) => !normalized || [document.title, document.brand, document.model, document.id, ...document.tags].join(" ").toLowerCase().includes(normalized));
+  return <div className="modal-backdrop" role="presentation"><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-label="Manual library">
+	    <div className="modal-header"><div><h2>Manual library</h2><p>Select the manual used by the current chat.</p></div><button className="icon-button" onClick={onClose} aria-label="Close manual library">×</button></div>
+    <label className="library-filter"><span className="sr-only">Filter manuals</span><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter by title, brand, model, or tag" /></label>
     {loading && <div className="modal-status">Loading manuals…</div>}
     {error && <div className="message-error">{error} <button onClick={() => void onRefresh()}>Retry</button></div>}
     {!loading && !error && <div className="manual-list">
       <button className="manual-item" onClick={() => onSelect("")}><strong>All manuals</strong><span>Search every imported document</span></button>
-      {documents.map((document) => <div className="manual-item" key={document.id}>
+      {visible.map((document) => <div className="manual-item" key={document.id}>
 		<strong>{document.title}</strong><div className="manual-metadata"><span><b>ID</b> {document.id}</span>{document.brand && <span><b>Brand</b> {document.brand}</span>}{document.model && <span><b>Model</b> {document.model}</span>}{document.tags.length > 0 && <span><b>Tags</b> {document.tags.join(", ")}</span>}</div><span>{document.chunk_count} chunks · {document.page_count} pages</span>
 		<div className="manual-actions"><button onClick={() => onSelect(document.id)}>Use in chat</button><button onClick={() => onOpen(document.id)}>Open manual</button><button onClick={() => onHealth(document)}>Health</button><button className="remove-manual" onClick={() => onRemove(document)}>Remove</button></div>
       </div>)}
+      {normalized && !visible.length && <div className="modal-status">No manuals match “{filter}”.</div>}
     </div>}
   </div></div>;
 }
@@ -366,15 +435,31 @@ function ManualViewer({ manual, documentId, chunkId, onAsk, onClose }: { manual?
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [tocOpen, setTocOpen] = useState(false);
   const loadingMoreRef = useRef(false);
+  const dialogRef = useDialog<HTMLElement>(onClose);
   useEffect(() => {
     let active = true; setLoading(true); setHasMore(true); setError(""); loadingMoreRef.current = false;
     loadDocumentChunks(documentId, chunkId).then((page) => {
       if (!active) return; setChunks(page); setLoading(false); setHasMore(page.length === 50);
-      setTimeout(() => document.getElementById(`chunk-${chunkId}`)?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      setTimeout(() => {
+        const target = document.getElementById(`chunk-${chunkId}`);
+        const container = target?.closest("main");
+        if (target && container) container.scrollTo({ top: target.offsetTop - 20, behavior: "smooth" });
+      }, 50);
     }).catch((reason) => { if (active) { setError(reason instanceof Error ? reason.message : "Could not load manual"); setLoading(false); } });
     return () => { active = false; };
   }, [documentId, chunkId]);
+  useEffect(() => {
+    const value = query.trim();
+    if (!value) { setResults([]); setSearching(false); return; }
+    let active = true; setSearching(true);
+    const timer = window.setTimeout(() => searchManual(value, documentId).then((items) => { if (active) setResults(items); }).catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Search failed"); }).finally(() => { if (active) setSearching(false); }), 250);
+    return () => { active = false; clearTimeout(timer); };
+  }, [documentId, query]);
   const loadMore = async () => {
     if (!hasMore || loadingMoreRef.current) return;
     loadingMoreRef.current = true; setLoadingMore(true);
@@ -390,9 +475,10 @@ function ManualViewer({ manual, documentId, chunkId, onAsk, onClose }: { manual?
     }
   };
   const loadNearEnd = (element: HTMLElement) => { if (element.scrollHeight - element.scrollTop - element.clientHeight < 160) void loadMore(); };
-  return <div className="viewer-backdrop"><section className="manual-viewer" role="dialog" aria-modal="true">
-    <header><div><h2>{manual?.title || documentId}</h2><span>{[manual?.id || documentId, manual?.brand, manual?.model, ...(manual?.tags || [])].filter(Boolean).join(" · ")}</span></div><button className="icon-button" onClick={onClose}>×</button></header>
-    <div className="viewer-layout"><nav onScroll={(event) => loadNearEnd(event.currentTarget)}>{chunks.map((chunk) => <a key={chunk.id} href={`#manual/${encodeURIComponent(documentId)}/chunk/${chunk.id}`}>{chunk.heading_path || `Chunk ${chunk.ordinal}`}</a>)}{hasMore && <button className="toc-load-more" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading sections…" : "Load more sections"}</button>}</nav>
+  const openResult = (result: SearchResult) => { setTocOpen(false); location.hash = `manual/${encodeURIComponent(documentId)}/chunk/${result.chunk_id}`; };
+  return <div className="viewer-backdrop"><section ref={dialogRef} className="manual-viewer" role="dialog" aria-modal="true" aria-label={`${manual?.title || documentId} manual viewer`}>
+    <header><button className="viewer-toc-button mobile-only" onClick={() => setTocOpen((value) => !value)} aria-expanded={tocOpen}>Sections</button><div><h2>{manual?.title || documentId}</h2><span>{[manual?.id || documentId, manual?.brand, manual?.model, ...(manual?.tags || [])].filter(Boolean).join(" · ")}</span></div><button className="icon-button" onClick={onClose} aria-label="Close manual viewer">×</button></header>
+	    <div className={`viewer-layout ${tocOpen ? "toc-open" : ""}`}><nav onScroll={(event) => loadNearEnd(event.currentTarget)}><label className="viewer-search"><span className="sr-only">Search this manual</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search this manual" /></label>{query.trim() ? <div className="viewer-results">{searching && <span>Searching…</span>}{!searching && !results.length && <span>No matching sections</span>}{results.map((result) => <button key={result.chunk_id} onClick={() => openResult(result)}><strong>{result.heading_path || "Untitled section"}</strong><small>{result.page_number ? `Page ${result.page_number} · ` : ""}{result.snippet}</small></button>)}</div> : <>{chunks.map((chunk) => <a className={chunk.id === chunkId ? "active" : ""} key={chunk.id} href={`#manual/${encodeURIComponent(documentId)}/chunk/${chunk.id}`} onClick={() => setTocOpen(false)}>{chunk.heading_path || `Chunk ${chunk.ordinal}`}</a>)}{hasMore && <button className="toc-load-more" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading sections…" : "Load more sections"}</button>}</>}</nav>
       <main onScroll={(event) => loadNearEnd(event.currentTarget)}>{loading && <p>Loading manual…</p>}{error && <div className="message-error">{error}</div>}{chunks.map((chunk) => <article id={`chunk-${chunk.id}`} className={chunk.id === chunkId ? "target-chunk" : ""} key={chunk.id}>
         <div className="chunk-heading"><div><h3>{chunk.heading_path}</h3><div className="chunk-meta">{chunk.page_number ? `Page ${chunk.page_number} · ` : ""}lines {chunk.start_line}–{chunk.end_line}</div></div><button onClick={() => onAsk(chunk)}>Ask about this section</button></div>
         <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{chunk.text}</ReactMarkdown></div>
@@ -403,8 +489,8 @@ function ManualViewer({ manual, documentId, chunkId, onAsk, onClose }: { manual?
 }
 
 function ConfirmDeleteChat({ chat, streaming, onCancel, onConfirm }: { chat: Chat; streaming: boolean; onCancel(): void; onConfirm(): void }) {
-  useEffect(() => { const cancel = (event: KeyboardEvent) => { if (event.key === "Escape") onCancel(); }; window.addEventListener("keydown", cancel); return () => window.removeEventListener("keydown", cancel); }, [onCancel]);
-  return <div className="modal-backdrop"><div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-chat-title">
+  const dialogRef = useDialog<HTMLDivElement>(onCancel);
+	  return <div className="modal-backdrop"><div ref={dialogRef} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-chat-title">
     <h2 id="delete-chat-title">Delete chat?</h2><p>“{chat.title}” and its messages will be permanently removed.{streaming ? " The active response will be stopped." : ""}</p>
     <div className="confirm-actions"><button onClick={onCancel} autoFocus>Cancel</button><button className="danger-button" onClick={onConfirm}>Delete</button></div>
   </div></div>;
@@ -413,9 +499,9 @@ function ConfirmDeleteChat({ chat, streaming, onCancel, onConfirm }: { chat: Cha
 function ConfirmDeleteDocument({ document, onCancel, onConfirm }: { document: DocumentInfo; onCancel(): void; onConfirm(): Promise<void> }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  useEffect(() => { const cancel = (event: KeyboardEvent) => { if (event.key === "Escape" && !busy) onCancel(); }; window.addEventListener("keydown", cancel); return () => window.removeEventListener("keydown", cancel); }, [busy, onCancel]);
+  const dialogRef = useDialog<HTMLDivElement>(onCancel, !busy);
   const remove = async () => { setBusy(true); setError(""); try { await onConfirm(); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not remove manual"); setBusy(false); } };
-  return <div className="modal-backdrop"><div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-document-title">
+	  return <div className="modal-backdrop"><div ref={dialogRef} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-document-title">
     <h2 id="delete-document-title">Remove manual?</h2><p>“{document.title}” and its indexed chunks and images will be permanently removed. Existing chats will switch to all manuals.</p>
     {error && <div className="message-error">{error}</div>}<div className="confirm-actions"><button onClick={onCancel} disabled={busy} autoFocus>Cancel</button><button className="danger-button" onClick={() => void remove()} disabled={busy}>{busy ? "Removing…" : "Remove"}</button></div>
   </div></div>;
@@ -426,8 +512,9 @@ function DocumentHealthDialog({ document, onClose, onSettings }: { document: Doc
   const [error, setError] = useState("");
   useEffect(() => { let active = true; documentHealth(document.id).then((value) => { if (active) setHealth(value); }).catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Could not load document health"); }); return () => { active = false; }; }, [document.id]);
   const state = (coverage: { complete: boolean; total: number }) => coverage.total === 0 ? "Empty" : coverage.complete ? "Healthy" : "Incomplete";
-  return <div className="modal-backdrop"><div className="modal health-dialog" role="dialog" aria-modal="true" aria-labelledby="health-title">
-    <div className="modal-header"><div><h2 id="health-title">Document health</h2><p>{document.title}</p></div><button className="icon-button" onClick={onClose}>×</button></div>
+  const dialogRef = useDialog<HTMLDivElement>(onClose);
+	  return <div className="modal-backdrop"><div ref={dialogRef} className="modal health-dialog" role="dialog" aria-modal="true" aria-labelledby="health-title">
+	    <div className="modal-header"><div><h2 id="health-title">Document health</h2><p>{document.title}</p></div><button className="icon-button" onClick={onClose} aria-label="Close document health">×</button></div>
     {!health && !error && <div className="modal-status">Checking document…</div>}{error && <div className="message-error">{error}</div>}
     {health && <><div className="health-counts"><div><strong>{health.chunk_count}</strong><span>Chunks</span></div><div><strong>{health.image_count}</strong><span>Images</span></div></div>
       <div className="health-index"><div><strong>Full-text index</strong><span>{state(health.fts)} · {health.fts.indexed}/{health.fts.total} chunks</span></div><div><strong>Vector index</strong><span>{!health.vectors.configured ? "Not configured" : health.vectors.stale ? `Stale · ${health.vectors.indexed}/${health.vectors.total} chunks` : `${state(health.vectors)} · ${health.vectors.indexed}/${health.vectors.total} chunks`}</span></div></div>
@@ -436,20 +523,23 @@ function DocumentHealthDialog({ document, onClose, onSettings }: { document: Doc
   </div></div>;
 }
 
-function SettingsDialog({ onClose }: { onClose(): void }) {
+function SettingsDialog({ onClose, onNotify }: { onClose(): void; onNotify(message: string): void }) {
   const [value, setValue] = useState<Settings | null>(null); const [index, setIndex] = useState<EmbeddingIndexStatus | null>(null);
   const [status, setStatus] = useState("Loading…"); const [busy, setBusy] = useState(false);
   const refresh = async () => { try { const [settings, indexStatus] = await Promise.all([getSettings(), embeddingIndexStatus()]); setValue(settings); setIndex(indexStatus); setStatus(""); } catch (error) { setStatus(error instanceof Error ? error.message : "Could not load settings"); } };
   useEffect(() => void refresh(), []);
-  if (!value) return <div className="modal-backdrop"><div className="modal"><div className="modal-header"><h2>Settings</h2><button className="icon-button" onClick={onClose}>×</button></div><p>{status}</p></div></div>;
+  const dialogRef = useDialog<HTMLDivElement>(onClose, !busy);
+  if (!value) return <div className="modal-backdrop"><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-label="Settings"><div className="modal-header"><h2>Settings</h2><button className="icon-button" onClick={onClose} aria-label="Close settings">×</button></div><p>{status}</p></div></div>;
   const changeProvider = (field: string, fieldValue: string) => setValue({ ...value, provider: { ...value.provider, [field]: fieldValue } });
   const changeEmbedding = (field: string, fieldValue: string | number) => setValue({ ...value, embedding: { ...value.embedding, [field]: fieldValue } });
-  const save = async () => { setBusy(true); try { setValue(await saveSettings(value)); setStatus("Settings saved"); await refresh(); } catch (error) { setStatus(error instanceof Error ? error.message : "Save failed"); } finally { setBusy(false); } };
-  const test = async (target: "provider" | "embedding") => { setBusy(true); try { const result = await testSettings(target); setStatus(`${target} connection OK: ${result.model}${result.dimensions ? ` (${result.dimensions} dimensions)` : ""}`); } catch (error) { setStatus(error instanceof Error ? error.message : "Test failed"); } finally { setBusy(false); } };
-  const build = async () => { setBusy(true); try { const result = await buildEmbeddingIndex((indexed, total) => setStatus(`Embedding ${indexed}/${total} chunks…`)); setIndex(result); setStatus("Embedding index complete"); } catch (error) { setStatus(error instanceof Error ? error.message : "Index build failed"); } finally { setBusy(false); } };
-  return <div className="modal-backdrop"><div className="modal settings-modal" role="dialog" aria-modal="true"><div className="modal-header"><div><h2>Provider settings</h2><p>Saved to config.toml. Environment variables override these values.</p></div><button className="icon-button" onClick={onClose}>×</button></div>
-    <fieldset><legend>Chat provider</legend><label>Base URL<input value={value.provider.base_url} onChange={(event) => changeProvider("base_url", event.target.value)} /></label><label>Model<input value={value.provider.model} onChange={(event) => changeProvider("model", event.target.value)} /></label><label>Timeout<input value={value.provider.timeout} onChange={(event) => changeProvider("timeout", event.target.value)} /></label><KeyFields settings={value.provider} change={changeProvider} /><button onClick={() => void test("provider")} disabled={busy}>Test chat connection</button></fieldset>
-    <fieldset><legend>Embedding provider</legend><label>Base URL<input value={value.embedding.base_url} onChange={(event) => changeEmbedding("base_url", event.target.value)} /></label><label>Model<input value={value.embedding.model} onChange={(event) => changeEmbedding("model", event.target.value)} /></label><div className="settings-grid"><label>Dimensions<input type="number" value={value.embedding.dimensions} onChange={(event) => changeEmbedding("dimensions", Number(event.target.value))} /></label><label>Batch size<input type="number" value={value.embedding.batch_size} onChange={(event) => changeEmbedding("batch_size", Number(event.target.value))} /></label></div><label>Query instruction<textarea value={value.embedding.query_instruction} onChange={(event) => changeEmbedding("query_instruction", event.target.value)} /></label><KeyFields settings={value.embedding} change={changeEmbedding} /><button onClick={() => void test("embedding")} disabled={busy}>Test embedding connection</button></fieldset>
+  const save = async () => { setBusy(true); try { setValue(await saveSettings(value)); setStatus("Settings saved"); onNotify("Settings saved"); await refresh(); } catch (error) { setStatus(error instanceof Error ? error.message : "Save failed"); } finally { setBusy(false); } };
+  const test = async (target: "provider" | "embedding") => { setBusy(true); try { const result = await testSettings(target); setStatus(`${target} connection OK: ${result.model}${result.dimensions ? ` (${result.dimensions} dimensions)` : ""}`); onNotify(`${target === "provider" ? "Chat" : "Embedding"} connection succeeded`); } catch (error) { setStatus(error instanceof Error ? error.message : "Test failed"); } finally { setBusy(false); } };
+  const build = async () => { setBusy(true); try { const result = await buildEmbeddingIndex((indexed, total) => setStatus(`Embedding ${indexed}/${total} chunks…`)); setIndex(result); setStatus("Embedding index complete"); onNotify("Embedding index complete"); } catch (error) { setStatus(error instanceof Error ? error.message : "Index build failed"); } finally { setBusy(false); } };
+	  return <div className="modal-backdrop"><div ref={dialogRef} className="modal settings-modal" role="dialog" aria-modal="true" aria-label="Provider settings"><div className="modal-header"><div><h2>Provider settings</h2><p>Saved to config.toml. Environment variables override these values. Embeddings are optional and improve search quality.</p></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="Close settings">×</button></div>
+    <div className="settings-sections">
+      <fieldset><legend>Chat provider</legend><label>Base URL<input value={value.provider.base_url} onChange={(event) => changeProvider("base_url", event.target.value)} /></label><label>Model<input value={value.provider.model} onChange={(event) => changeProvider("model", event.target.value)} /></label><label>Timeout<input value={value.provider.timeout} onChange={(event) => changeProvider("timeout", event.target.value)} /></label><KeyFields settings={value.provider} change={changeProvider} /><button onClick={() => void test("provider")} disabled={busy}>Test chat connection</button></fieldset>
+      <fieldset><legend>Embedding provider</legend><label>Base URL<input value={value.embedding.base_url} onChange={(event) => changeEmbedding("base_url", event.target.value)} /></label><label>Model<input value={value.embedding.model} onChange={(event) => changeEmbedding("model", event.target.value)} /></label><div className="settings-grid"><label>Dimensions<input type="number" value={value.embedding.dimensions} onChange={(event) => changeEmbedding("dimensions", Number(event.target.value))} /></label><label>Batch size<input type="number" value={value.embedding.batch_size} onChange={(event) => changeEmbedding("batch_size", Number(event.target.value))} /></label></div><label>Query instruction<textarea value={value.embedding.query_instruction} onChange={(event) => changeEmbedding("query_instruction", event.target.value)} /></label><KeyFields settings={value.embedding} change={changeEmbedding} /><button onClick={() => void test("embedding")} disabled={busy}>Test embedding connection</button></fieldset>
+    </div>
     {value.environment_overrides.length > 0 && <p className="settings-warning">Environment overrides: {value.environment_overrides.join(", ")}</p>}
     <div className="index-status"><strong>Vector index</strong><span>{index?.complete ? `${index.indexed}/${index.total} chunks indexed` : `Stale · ${index?.indexed || 0}/${index?.total || 0}`}</span><button onClick={() => void build()} disabled={busy}>Build embeddings</button></div>
     {status && <p className="modal-status">{status}</p>}<div className="modal-footer"><span>Keys are never returned by the API.</span><button onClick={() => void save()} disabled={busy}>Save settings</button></div>
@@ -475,6 +565,7 @@ function ImportDialog({ onClose, onImported }: { onClose(): void; onImported(): 
   const completed = files.filter((file) => ["success", "error"].includes(statuses[importFileKey(file)]?.state)).length;
   const failed = files.filter((file) => statuses[importFileKey(file)]?.state === "error").length;
   const succeeded = files.filter((file) => statuses[importFileKey(file)]?.state === "success").length;
+  const dialogRef = useDialog<HTMLDivElement>(onClose, !busy);
   const selectFiles = (selected: File[]) => {
     const markdown = selected.filter((file) => /\.(?:md|markdown)$/i.test(file.name) || file.type === "text/markdown");
     setFiles(markdown);
@@ -507,8 +598,8 @@ function ImportDialog({ onClose, onImported }: { onClose(): void; onImported(): 
     }
   };
 
-  return <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-label="Import Markdown">
-    <div className="modal-header"><div><h2>Import Markdown</h2><p>Embedded PNG, JPEG, GIF, and WebP images are stored with their source sections.</p></div><button className="icon-button" onClick={onClose} disabled={busy}>×</button></div>
+	  return <div className="modal-backdrop" role="presentation"><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-label="Import Markdown">
+	    <div className="modal-header"><div><h2>Import Markdown</h2><p>Embedded PNG, JPEG, GIF, and WebP images are stored with their source sections.</p></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="Close import dialog">×</button></div>
     <div className="import-metadata">
       <label>Document ID<input value={metadata.id} disabled={busy || files.length > 1} placeholder="Generated from title when empty" onChange={(event) => setMetadata({ ...metadata, id: event.target.value })} /><small>{files.length > 1 ? "A custom ID can only be used when importing one file." : "Stable identifier used by links and replacement imports."}</small></label>
       <label>Brand<input value={metadata.brand} disabled={busy} placeholder="e.g. Elektron" onChange={(event) => setMetadata({ ...metadata, brand: event.target.value })} /></label>
