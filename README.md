@@ -1,18 +1,49 @@
-# Dogear
+# DogEar
 
-Dogear is a local CLI and web application for searching and asking questions
+DogEar is a local CLI and web application for searching and asking questions
 about Markdown manuals. It combines SQLite FTS5 search, optional sqlite-vec
 embeddings, local reranking, and citation-grounded answers from
 OpenAI-compatible providers. It is aimed at synthesizer manuals and other
 reference documents that have already been converted to Markdown.
 
+## Requirements
+
+- Go 1.26.3 or newer.
+- Node.js and npm only when rebuilding or developing the React frontend.
+- An OpenAI-compatible chat endpoint for generated answers. Ollama-style local
+  endpoints are supported.
+- An optional OpenAI-compatible embedding endpoint for hybrid search.
+
+SQLite is provided through the pure-Go `modernc.org/sqlite` driver; a separate
+SQLite installation is not required.
+
 ## Build
 
+The repository includes a prebuilt frontend under `internal/server/static`, so
+a normal Go build produces a self-contained executable:
+
 ```sh
-go build ./cmd/dogear
+go build -o dogear ./cmd/dogear
 ```
 
-This creates `./dogear`.
+The server uses `go:embed`, so the resulting `./dogear` binary contains the web
+UI and does not need frontend files beside it at runtime.
+
+When frontend source under `web/` has changed, rebuild the assets before the Go
+binary:
+
+```sh
+cd web
+npm ci
+npm test
+npm run build
+cd ..
+go build -o dogear ./cmd/dogear
+```
+
+`npm run build` writes hashed assets to `internal/server/static/`. Rebuilding an
+already-running binary does not update that process; restart `dogear serve` to
+load the new embedded assets.
 
 ## Basic Workflow
 
@@ -26,9 +57,14 @@ This creates `./dogear`.
 ./dogear doctor
 ```
 
-By default Dogear stores its SQLite database at `.dogear/dogear.db`. Use `--db PATH` with any command to target a different database.
+By default DogEar stores its SQLite database at `.dogear/dogear.db`. Use `--db PATH` with any command to target a different database.
 
 `dogear init` also creates `.dogear/config.toml` if it does not already exist. Use `--config PATH` to target a different config file.
+
+Available commands are `init`, `import`, `index`, `list`, `info`, `remove`,
+`search`, `show`, `context`, `doctor`, `eval`, `ask`, and `serve`. Run
+`./dogear COMMAND --help` for command-specific flags. `convert` is currently a
+placeholder and returns a not-implemented error.
 
 ## Importing Manuals
 
@@ -44,7 +80,7 @@ Import a directory recursively:
 ./dogear import ./manuals
 ```
 
-If a document id already exists, Dogear refuses to overwrite it. Use `--replace` to remove the old document, chunks, and FTS rows before importing the new version:
+If a document id already exists, DogEar refuses to overwrite it. Use `--replace` to remove the old document, chunks, and FTS rows before importing the new version:
 
 ```sh
 ./dogear import ./manuals/yamaha-dx7.md --id yamaha-dx7 --replace
@@ -58,11 +94,12 @@ If a document id already exists, Dogear refuses to overwrite it. Use `--replace`
 ./dogear remove yamaha-dx7
 ```
 
-Use `--json` on `list`, `info`, `search`, `show`, `context`, and `doctor` for machine-readable output.
+Use `--json` on `list`, `info`, `search`, `show`, `context`, `doctor`, `eval`,
+and `ask` for machine-readable output.
 
 ## Page Markers
 
-Markdown converted from PDFs often loses exact page breaks. Dogear can infer some pages from a table of contents, but explicit page markers are more accurate.
+Markdown converted from PDFs often loses exact page breaks. DogEar can infer some pages from a table of contents, but explicit page markers are more accurate.
 
 Supported marker forms:
 
@@ -81,7 +118,9 @@ To inspect the chunks that `ask` uses:
 ./dogear context "How do I turn off local control?"
 ```
 
-This uses the current FTS5 retrieval path and prints ranked source chunks with stable source labels, page when known, heading, and line range.
+This uses the configured retrieval path—hybrid when the vector index is current,
+otherwise FTS5—and prints ranked source chunks with stable source labels, page
+when known, heading, and line range.
 
 Available context formats:
 
@@ -93,7 +132,7 @@ Available context formats:
 
 The `prompt` format emits the bounded context block used by `ask`. Sources are labeled per response as `[1]`, `[2]`, and so on, and answers should cite those labels.
 
-Dogear retrieves with SQLite FTS5, then locally reranks candidates to prefer real prose sections over table-of-contents, index, and short page-reference chunks. Use `--debug` to inspect raw BM25 score, rerank score, quality class, and reason flags:
+DogEar retrieves with SQLite FTS5, then locally reranks candidates to prefer real prose sections over table-of-contents, index, and short page-reference chunks. Use `--debug` to inspect raw BM25 score, rerank score, quality class, and reason flags:
 
 ```sh
 ./dogear context "How do I configure MIDI sync?" --debug
@@ -103,9 +142,10 @@ Dogear retrieves with SQLite FTS5, then locally reranks candidates to prefer rea
 
 ## Asking Questions
 
-Dogear supports local and online OpenAI-compatible chat completion endpoints.
+DogEar supports local and online OpenAI-compatible chat completion endpoints.
 
-Provider settings can live in `.dogear/config.toml`:
+Provider settings can live in `.dogear/config.toml` or be edited from the web
+UI. API keys are masked and are never returned by the settings API.
 
 ```toml
 [provider]
@@ -179,7 +219,15 @@ export DOGEAR_MODEL=llama3.1
 ./dogear ask "How do I turn off local control?" --base-url http://localhost:11434/v1 --model llama3.1
 ```
 
-Configuration precedence is: CLI flags, environment variables, config file, defaults.
+Chat-provider configuration precedence is: CLI flags, environment variables,
+config file, defaults. Embedding configuration uses environment variables,
+then the config file, then defaults.
+
+Embedding settings use the corresponding
+`DOGEAR_EMBEDDING_BASE_URL`, `DOGEAR_EMBEDDING_API_KEY`,
+`DOGEAR_EMBEDDING_MODEL`, `DOGEAR_EMBEDDING_DIMENSIONS`,
+`DOGEAR_EMBEDDING_BATCH_SIZE`, `DOGEAR_EMBEDDING_QUERY_INSTRUCTION`, and
+`DOGEAR_EMBEDDING_TIMEOUT` environment variables.
 
 Use `--dry-run` to print the provider URL, redacted headers, and JSON body without making a network call:
 
@@ -217,16 +265,24 @@ curl -X POST http://127.0.0.1:8765/api/ask \
 ```
 
 The web UI keeps chats in browser storage, supports a manual per chat (or all
-manuals), streams answers, and can import `.md` or `.markdown` files. Embedded
-base64 PNG, JPEG, GIF, and WebP image data is stored outside the search index,
-while image alt text participates in FTS and embedding retrieval. Matching
-images are returned with search and context results and shown with relevant
-sources. When a question explicitly requests an image, matching retrieved
-images are also displayed inline beneath the answer.
+manuals), streams answers, and can import one or more `.md` or `.markdown`
+files. It includes suggested prompts, answer retry/regeneration, question
+editing, copy actions, chat-deletion undo, chat backup import/export, chat and
+manual-library filtering, readiness status, and full-text search inside the
+manual viewer. Keyboard shortcuts include `Cmd/Ctrl+N` for a new chat,
+`Cmd/Ctrl+K` for search, and `/` to focus the composer.
+
+Embedded base64 PNG, JPEG, GIF, and WebP image data is stored separately from
+searchable chunk text, while image alt text participates in FTS and embedding
+retrieval. Matching images are returned with search and context results and
+shown with relevant sources. When a question explicitly requests an image,
+matching retrieved images are also displayed inline beneath the answer.
 
 Citation cards open a deep-linked manual viewer at the retrieved chunk. The
 Settings panel edits masked chat/embedding configuration, tests both endpoints,
 shows vector-index coverage, and streams explicit embedding rebuild progress.
+When hybrid retrieval is unavailable, answers remain usable through automatic
+FTS fallback and the UI reports that fallback.
 
 The streaming endpoint uses server-sent events:
 
@@ -236,21 +292,31 @@ curl -N -X POST http://127.0.0.1:8765/api/ask/stream \
   -d '{"question":"How do I turn off local control?","history":[]}'
 ```
 
-To rebuild the embedded frontend after editing `web/`:
+The production UI is always served from assets embedded in the Go binary.
+Generated files under `internal/server/static/` should be committed with
+frontend source changes.
+
+## Development and Verification
+
+Run the complete Go checks from the repository root:
 
 ```sh
-cd web
-npm ci
+go test ./...
+go vet ./...
+```
+
+Run frontend tests and produce production assets from `web/`:
+
+```sh
 npm test
 npm run build
 ```
 
-The generated files under `internal/server/static/` are embedded in the Go
-binary and should be committed with frontend source changes.
+After `npm run build`, compile the Go binary again to embed the new assets.
 
 ## Architecture
 
-Dogear keeps application behavior separate from delivery and persistence:
+DogEar keeps application behavior separate from delivery and persistence:
 
 - `internal/app` contains provider-independent question-answering workflows.
 - `internal/adapters/dogear` adapts the persistence retrieval interface for the

@@ -291,10 +291,16 @@ func (h *Handler) resolvedEmbedding(ctx context.Context) (embedding.Config, erro
 
 func (h *Handler) testSettings(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Target string `json:"target"`
+		Target    string                    `json:"target"`
+		Provider  *settingsProviderPayload  `json:"provider,omitempty"`
+		Embedding *settingsEmbeddingPayload `json:"embedding,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if request.Target != "provider" && request.Target != "embedding" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("target must be provider or embedding"))
 		return
 	}
 	if request.Target == "embedding" {
@@ -303,12 +309,38 @@ func (h *Handler) testSettings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadGateway, err)
 			return
 		}
+		if request.Embedding != nil {
+			config.BaseURL = strings.TrimSpace(request.Embedding.BaseURL)
+			config.Model = strings.TrimSpace(request.Embedding.Model)
+			config.Dimensions = request.Embedding.Dimensions
+			config.BatchSize = request.Embedding.BatchSize
+			config.QueryInstruction = strings.TrimSpace(request.Embedding.QueryInstruction)
+			if config.Dimensions < 32 || config.Dimensions > 4096 {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("embedding dimensions must be between 32 and 4096"))
+				return
+			}
+			if config.BatchSize < 1 || config.BatchSize > 256 {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("embedding batch size must be between 1 and 256"))
+				return
+			}
+			if request.Embedding.Timeout != "" {
+				config.Timeout, err = time.ParseDuration(request.Embedding.Timeout)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, fmt.Errorf("invalid embedding timeout: %w", err))
+					return
+				}
+			}
+			if err := applyKeyAction(&config.APIKey, request.Embedding.APIKeyAction, request.Embedding.APIKey); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
 		client, err := embedding.NewClient(config)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		vectors, err := client.Embed(r.Context(), []string{"Dogear embedding connectivity test"})
+		vectors, err := client.Embed(r.Context(), []string{"DogEar embedding connectivity test"})
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
 			return
@@ -320,6 +352,21 @@ func (h *Handler) testSettings(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	if request.Provider != nil {
+		provider.BaseURL = strings.TrimSpace(request.Provider.BaseURL)
+		provider.Model = strings.TrimSpace(request.Provider.Model)
+		if request.Provider.Timeout != "" {
+			provider.Timeout, err = time.ParseDuration(request.Provider.Timeout)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid provider timeout: %w", err))
+				return
+			}
+		}
+		if err := applyKeyAction(&provider.APIKey, request.Provider.APIKeyAction, request.Provider.APIKey); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 	if err := testModelEndpoint(r.Context(), provider); err != nil {
 		writeError(w, http.StatusBadGateway, err)

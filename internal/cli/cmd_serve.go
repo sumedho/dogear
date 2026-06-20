@@ -12,7 +12,7 @@ func newServeCommand(opts *rootOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Serve the local Dogear HTML UI and JSON API",
+		Short: "Serve the local DogEar HTML UI and JSON API",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runServe(cmd, opts, addr)
 		},

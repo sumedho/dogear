@@ -11,7 +11,7 @@ import (
 func newInitCommand(opts *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
-		Short: "Initialize a Dogear database",
+		Short: "Initialize a DogEar database",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := resolveDBPath(opts.dbPath)
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

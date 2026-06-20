@@ -119,6 +119,50 @@ timeout = "120s"
 	}
 }
 
+func TestSettingsTestUsesDraftWithoutSaving(t *testing.T) {
+	var authorization string
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("draft test path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer provider.Close()
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	content := `[provider]
+base_url = "http://saved.invalid/v1"
+model = "saved-model"
+api_key = "saved-key"
+timeout = "60s"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(Options{Store: testStore(t), ConfigPath: configPath})
+	payload := map[string]any{
+		"target":   "provider",
+		"provider": map[string]any{"base_url": provider.URL + "/v1", "model": "draft-model", "timeout": "5s", "api_key_action": "replace", "api_key": "draft-key"},
+	}
+	raw, _ := json.Marshal(payload)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/settings/test", bytes.NewReader(raw))
+	request.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"model":"draft-model"`) {
+		t.Fatalf("draft test status=%d body=%s", response.Code, response.Body.String())
+	}
+	if authorization != "Bearer draft-key" {
+		t.Fatalf("authorization = %q", authorization)
+	}
+	saved, _ := os.ReadFile(configPath)
+	if !strings.Contains(string(saved), "saved-model") || strings.Contains(string(saved), "draft-model") || strings.Contains(string(saved), "draft-key") {
+		t.Fatalf("draft test mutated settings: %s", saved)
+	}
+}
+
 func TestAskDryRun(t *testing.T) {
 	store := testStore(t)
 	handler := New(Options{Store: store})

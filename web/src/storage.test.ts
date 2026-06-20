@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadChats, saveChats, storageKey } from "./storage";
+import { exportChats, loadChats, mergeChatBackup, saveChats, storageKey } from "./storage";
 import type { Chat } from "./types";
 
 describe("chat storage", () => {
@@ -23,5 +23,17 @@ describe("chat storage", () => {
   it("ignores malformed state", () => {
     expect(loadChats({ getItem: () => "not json" })).toEqual([]);
     expect(loadChats({ getItem: () => JSON.stringify([{ nope: true }]) })).toEqual([]);
+  });
+
+  it("exports and merges versioned backups without duplicating IDs", () => {
+    const existing: Chat[] = [{ id: "one", title: "Existing", documentId: "", draft: "", messages: [], createdAt: 1, updatedAt: 1 }];
+    const imported: Chat[] = [existing[0], { id: "two", title: "Imported", documentId: "manual", draft: "", messages: [], createdAt: 2, updatedAt: 2 }];
+    expect(mergeChatBackup(exportChats(imported), existing)).toMatchObject({ added: 1, duplicates: 1, chats: [{ id: "two" }, { id: "one" }] });
+  });
+
+  it("rejects malformed and unsupported backups", () => {
+    expect(() => mergeChatBackup("not json", [])).toThrow("valid JSON");
+    expect(() => mergeChatBackup(JSON.stringify({ version: 99, chats: [] }), [])).toThrow("Unsupported");
+    expect(() => mergeChatBackup(JSON.stringify({ version: 1, chats: [{ nope: true }] }), [])).toThrow("invalid chat data");
   });
 });

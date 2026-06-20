@@ -10,7 +10,7 @@ func newDoctorCommand(opts *rootOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Check Dogear database health",
+		Short: "Check DogEar database health",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := openStore(opts)
 			if err != nil {

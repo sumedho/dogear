@@ -57,7 +57,10 @@ export async function getSettings(): Promise<Settings> {
   return { ...settings, environment_overrides: settings.environment_overrides ?? [] };
 }
 export function saveSettings(settings: Settings): Promise<Settings> { return json("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(settings) }); }
-export function testSettings(target: "provider" | "embedding"): Promise<{ ok: boolean; model: string; dimensions?: number }> { return json("/api/settings/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }) }); }
+export function testSettings(target: "provider" | "embedding", settings: Settings): Promise<{ ok: boolean; model: string; dimensions?: number }> {
+  const draft = target === "provider" ? { provider: settings.provider } : { embedding: settings.embedding };
+  return json("/api/settings/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target, ...draft }) });
+}
 export function embeddingIndexStatus(): Promise<EmbeddingIndexStatus> { return json("/api/index/embeddings/status"); }
 
 export async function buildEmbeddingIndex(onProgress: (indexed: number, total: number) => void): Promise<EmbeddingIndexStatus> {

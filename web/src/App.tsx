@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { buildEmbeddingIndex, documentHealth, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, removeDocument as removeDocumentAPI, saveSettings, searchManual, streamAsk, testSettings } from "./api";
-import { loadChats, newChat, saveChats } from "./storage";
+import { exportChats, loadChats, mergeChatBackup, newChat, saveChats } from "./storage";
 import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentHealth, DocumentInfo, EmbeddingIndexStatus, SearchResult, Settings, SourceRef } from "./types";
 
 function useDialog<T extends HTMLElement>(onClose: () => void, canClose = true) {
@@ -34,6 +34,13 @@ type Toast = { message: string; action?: { label: string; run(): void } };
 function previousUserIndex(messages: ChatMessage[], before: number): number {
   for (let index = before - 1; index >= 0; index--) if (messages[index].role === "user") return index;
   return -1;
+}
+
+function chatGroup(updatedAt: number): string {
+  const age = Date.now() - updatedAt;
+  if (age < 24 * 60 * 60 * 1000) return "Today";
+  if (age < 7 * 24 * 60 * 60 * 1000) return "Previous 7 days";
+  return "Older";
 }
 
 function sourceDescription(source: SourceRef): string {
@@ -109,8 +116,13 @@ export default function App() {
   const [docsError, setDocsError] = useState("");
   const [controller, setController] = useState<AbortController | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
+  const [chatFilter, setChatFilter] = useState("");
+  const [readiness, setReadiness] = useState<{ label: string; state: "ready" | "limited" | "needed"; detail: string }>({ label: "Checking…", state: "limited", detail: "Checking configuration" });
+  const [pendingScope, setPendingScope] = useState<string | null>(null);
   const messagesRef = useRef<HTMLElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const chatFilterRef = useRef<HTMLInputElement>(null);
+  const chatImportRef = useRef<HTMLInputElement>(null);
   const cancelRenameRef = useRef(false);
   const current = chats.find((chat) => chat.id === activeId) || chats[0];
 
@@ -126,18 +138,45 @@ export default function App() {
     }
   };
 
-  useEffect(() => void refreshDocuments(), []);
+  const refreshReadiness = async () => {
+    try {
+      const [settings, index, library] = await Promise.all([getSettings(), embeddingIndexStatus(), listDocuments()]);
+      if (!library.length) setReadiness({ label: "Setup needed", state: "needed", detail: "Import a manual" });
+      else if (!settings.provider.model.trim() && !settings.environment_overrides.includes("DOGEAR_MODEL")) setReadiness({ label: "Setup needed", state: "needed", detail: "Configure a chat model" });
+      else if (!index.configured) setReadiness({ label: "FTS only", state: "limited", detail: "Embeddings are not configured" });
+      else if (index.stale || !index.complete) setReadiness({ label: "Index stale", state: "limited", detail: "Rebuild the embedding index" });
+      else setReadiness({ label: "Hybrid ready", state: "ready", detail: `${index.indexed}/${index.total} chunks indexed` });
+    } catch (error) {
+      setReadiness({ label: "Setup needed", state: "needed", detail: error instanceof Error ? error.message : "Could not read configuration" });
+    }
+  };
+
+  useEffect(() => { void refreshDocuments(); void refreshReadiness(); }, []);
 	useEffect(() => {
 		const restore = () => { const match = location.hash.match(/^#manual\/([^/]+)(?:\/chunk\/(\d+))?/); setViewer(match ? { documentId: decodeURIComponent(match[1]), chunkId: match[2] ? Number(match[2]) : undefined } : null); };
 		restore(); window.addEventListener("hashchange", restore); return () => window.removeEventListener("hashchange", restore);
 	}, []);
-  useEffect(() => saveChats(chats), [chats]);
+  useEffect(() => { try { saveChats(chats); } catch (error) { setToast({ message: error instanceof Error ? `Chats could not be saved: ${error.message}` : "Chats could not be saved" }); } }, [chats]);
   useEffect(() => {
     const messages = messagesRef.current;
     if (messages) messages.scrollTo({ top: messages.scrollHeight, behavior: "smooth" });
     if (window.scrollY) window.scrollTo(0, 0);
   }, [current?.messages]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(null), 5000); return () => clearTimeout(timer); }, [toast]);
+
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const editing = target?.matches("input, textarea, select, [contenteditable='true']");
+      const blockingOverlay = settingsOpen || importOpen || browseOpen || !!deleteChat || !!deleteDocument || !!healthDocument || pendingScope !== null;
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n" && !blockingOverlay && !viewer) { event.preventDefault(); createChat(); }
+      else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k" && !blockingOverlay) { event.preventDefault(); (viewer ? document.querySelector<HTMLInputElement>(".viewer-search input") : chatFilterRef.current)?.focus(); }
+      else if (event.key === "/" && !editing && !settingsOpen && !importOpen && !browseOpen && !viewer) { event.preventDefault(); composerRef.current?.focus(); }
+      else if (event.key === "Escape" && sidebarOpen) setSidebarOpen(false);
+    };
+    window.addEventListener("keydown", keydown);
+    return () => window.removeEventListener("keydown", keydown);
+  });
 
   const updateChat = (chatId: string, update: (chat: Chat) => Chat) => {
     setChats((items) => items.map((chat) => (chat.id === chatId ? update(chat) : chat)));
@@ -147,6 +186,7 @@ export default function App() {
     const chat = newChat();
     setChats((items) => [chat, ...items]);
     setActiveId(chat.id);
+    setPendingScope(null);
     setSidebarOpen(false);
   };
 
@@ -163,7 +203,13 @@ export default function App() {
   };
 
   const selectDocument = (documentId: string) => {
+    if (documentId !== current.documentId && current.messages.length > 0) { setPendingScope(documentId); return; }
     updateChat(current.id, (chat) => ({ ...chat, documentId, updatedAt: Date.now() }));
+  };
+
+  const applyDocument = (documentId: string) => {
+    updateChat(current.id, (chat) => ({ ...chat, documentId, updatedAt: Date.now() }));
+    setPendingScope(null);
   };
 
   const renameChat = () => {
@@ -248,6 +294,7 @@ export default function App() {
     if (viewer?.documentId === document.id) closeViewer();
     setDeleteDocument(null);
     setToast({ message: `Removed ${document.title}` });
+    void refreshReadiness();
   };
 
   const deleteChatWithUndo = (chat: Chat) => {
@@ -256,6 +303,31 @@ export default function App() {
     removeChat(chat.id);
     setToast({ message: `Deleted “${chat.title}”`, action: { label: "Undo", run: () => { setChats(previousChats); setActiveId(previousActiveId); setToast(null); } } });
   };
+
+  const downloadChats = () => {
+    const url = URL.createObjectURL(new Blob([exportChats(chats)], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = `dogear-chats-${new Date().toISOString().slice(0, 10)}.json`; link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setToast({ message: `Exported ${chats.length} chat${chats.length === 1 ? "" : "s"}` });
+  };
+
+  const importChatBackup = async (file?: File) => {
+    if (!file) return;
+    try {
+      const result = mergeChatBackup(await file.text(), chats);
+      setChats(result.chats);
+      setToast({ message: `Imported ${result.added} chat${result.added === 1 ? "" : "s"}${result.duplicates ? ` · ${result.duplicates} duplicate${result.duplicates === 1 ? "" : "s"} skipped` : ""}` });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : "Could not import chat backup" });
+    } finally {
+      if (chatImportRef.current) chatImportRef.current.value = "";
+    }
+  };
+
+  const normalizedChatFilter = chatFilter.trim().toLowerCase();
+  const visibleChats = chats.filter((chat) => !normalizedChatFilter || chat.title.toLowerCase().includes(normalizedChatFilter) || chat.messages.some((message) => message.content.toLowerCase().includes(normalizedChatFilter)));
+  const groupedChats = ["Today", "Previous 7 days", "Older"].map((label) => ({ label, chats: visibleChats.filter((chat) => chatGroup(chat.updatedAt) === label) })).filter((group) => group.chats.length);
 
   const suggestedPrompts = activeDocument
     ? [`How do I get started with the ${activeDocument.model || activeDocument.title}?`, "What are the most important settings?", "Show me the MIDI configuration steps"]
@@ -266,28 +338,29 @@ export default function App() {
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="brand-row">
           <div className="brand-mark">D</div>
-          <strong>Dogear</strong>
+          <strong>DogEar</strong>
           <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar">×</button>
         </div>
-        <button className="new-chat" onClick={createChat}><span>＋</span> New chat</button>
+        <button className="new-chat" onClick={createChat} title="New chat (⌘/Ctrl+N)"><span>＋</span> New chat</button>
         <div className="library-actions">
           <button onClick={() => setBrowseOpen(true)}>▤ <span>Browse manuals</span></button>
           <button onClick={() => setImportOpen(true)}>⇧ <span>Import Markdown</span></button>
 			<button onClick={() => setSettingsOpen(true)}>⚙ <span>Settings</span></button>
         </div>
-        <div className="sidebar-label">Chats</div>
+        <label className="chat-filter" title="Search chats (⌘/Ctrl+K)"><span className="sr-only">Search chats</span><input ref={chatFilterRef} type="search" value={chatFilter} onChange={(event) => setChatFilter(event.target.value)} placeholder="Search chats" /></label>
         <nav className="chat-list">
-          {chats.map((chat) => (
+          {groupedChats.map((group) => <section className="chat-group" key={group.label}><div className="sidebar-label">{group.label}</div>{group.chats.map((chat) => (
             <div className={`chat-row ${chat.id === current.id ? "active" : ""}`} key={chat.id}>
               {editingChat?.id === chat.id
                 ? <input className="chat-rename" autoFocus value={editingChat.title} onChange={(event) => setEditingChat({ id: chat.id, title: event.target.value })} onBlur={() => { if (!cancelRenameRef.current) renameChat(); cancelRenameRef.current = false; }} onKeyDown={(event) => { if (event.key === "Enter") renameChat(); if (event.key === "Escape") { cancelRenameRef.current = true; setEditingChat(null); } }} aria-label="Chat title" />
-                : <button className="chat-select" onClick={() => { setActiveId(chat.id); setSidebarOpen(false); }}>{chat.title}</button>}
+                : <button className="chat-select" onClick={() => { setActiveId(chat.id); setPendingScope(null); setSidebarOpen(false); }}>{chat.title}</button>}
               <button className="chat-action" onClick={() => { cancelRenameRef.current = false; setEditingChat({ id: chat.id, title: chat.title }); }} aria-label={`Rename ${chat.title}`}>✎</button>
               <button className="chat-action delete-chat" onClick={() => setDeleteChat(chat)} aria-label={`Delete ${chat.title}`}>×</button>
             </div>
-          ))}
+          ))}</section>)}
+          {!visibleChats.length && <div className="sidebar-empty">No matching chats</div>}
         </nav>
-        <div className="sidebar-footer">Local manual assistant</div>
+        <div className="sidebar-footer"><button onClick={downloadChats}>Export chats</button><button onClick={() => chatImportRef.current?.click()}>Import chats</button><input ref={chatImportRef} type="file" accept="application/json,.json" onChange={(event) => void importChatBackup(event.target.files?.[0])} /><span>Local manual assistant</span></div>
       </aside>
 
       <main className="chat-main">
@@ -298,6 +371,7 @@ export default function App() {
             {documents.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}
           </select>
           <span className="topbar-status">{activeDocument ? `${activeDocument.chunk_count} indexed chunks` : documents.length ? `${documents.length} manuals` : "No manuals"}</span>
+          <button className={`readiness readiness-${readiness.state}`} title={readiness.detail} onClick={() => setSettingsOpen(true)}>{readiness.label}</button>
         </header>
 
 	        <section ref={messagesRef} className="messages">
@@ -314,14 +388,14 @@ export default function App() {
             <article className={`message message-${message.role}`} key={message.id}>
               <div className="avatar">{message.role === "user" ? "Y" : "D"}</div>
               <div className="message-body">
-                <div className="message-author">{message.role === "user" ? "You" : "Dogear"}</div>
+                <div className="message-author">{message.role === "user" ? "You" : "DogEar"}</div>
                 {message.role === "assistant" ? (
                   <div className="markdown"><AnswerMarkdown message={message} onOpen={openViewer} /></div>
                 ) : <div className="user-text">{message.content}</div>}
 				{message.images && message.images.length > 0 && <AnswerImages images={message.images} onOpen={openViewer} />}
                 {message.status === "streaming" && <span className="streaming-cursor" aria-label="Streaming" />}
                 {message.error && <div className={`message-error ${message.status === "cancelled" ? "muted" : ""}`}>{message.error}</div>}
-                {message.role === "assistant" && message.retrieval?.fallback_reason && <div className="retrieval-note">Used full-text search because hybrid search was unavailable.</div>}
+                {message.role === "assistant" && message.retrieval?.fallback_reason && <div className="retrieval-note"><span>Used full-text search: {message.retrieval.fallback_reason}.</span><button onClick={() => setSettingsOpen(true)}>{message.retrieval.fallback_reason.includes("index") ? "Rebuild index" : "Configure embeddings"}</button></div>}
                 {message.sources && message.sources.length > 0 && <SourceCards message={message} onOpen={openViewer} />}
                 {message.role === "assistant" && message.status !== "streaming" && <div className="message-actions">
                   <button onClick={() => void navigator.clipboard.writeText(message.content)} disabled={!message.content}>Copy answer</button>
@@ -332,7 +406,7 @@ export default function App() {
               </div>
             </article>
           ))}
-          <div className="sr-only" role="status" aria-live="polite">{controller ? "Dogear is generating a response" : ""}</div>
+          <div className="sr-only" role="status" aria-live="polite">{controller ? "DogEar is generating a response" : ""}</div>
         </section>
 
         <div className="composer-wrap">
@@ -347,8 +421,9 @@ export default function App() {
                   void send();
                 }
               }}
-              placeholder={documents.length ? "Message Dogear" : "Import a manual before asking"}
+              placeholder={documents.length ? "Message DogEar" : "Import a manual before asking"}
               disabled={!documents.length}
+              title="Press / to focus · Enter to send · Shift+Enter for a new line"
               rows={1}
             />
             {controller ? <button className="send-button stop" onClick={() => controller.abort()} aria-label="Stop response">■</button>
@@ -359,12 +434,13 @@ export default function App() {
       </main>
 
       {browseOpen && <ManualDialog documents={documents} loading={loadingDocs} error={docsError} onRefresh={refreshDocuments} onSelect={(id) => { selectDocument(id); setBrowseOpen(false); }} onOpen={(id) => { setBrowseOpen(false); openViewer(id); }} onHealth={(document) => { setBrowseOpen(false); setHealthDocument(document); }} onRemove={(document) => { setBrowseOpen(false); setDeleteDocument(document); }} onClose={() => setBrowseOpen(false)} />}
-      {importOpen && <ImportDialog onClose={() => setImportOpen(false)} onImported={async () => { await refreshDocuments(); setToast({ message: "Manual library updated" }); }} />}
-			{settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onNotify={(message) => setToast({ message })} />}
+      {importOpen && <ImportDialog onClose={() => setImportOpen(false)} onImported={async () => { await refreshDocuments(); await refreshReadiness(); setToast({ message: "Manual library updated" }); }} />}
+			{settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onNotify={(message) => setToast({ message })} onChanged={() => void refreshReadiness()} />}
 		{viewer && <ManualViewer manual={documents.find((item) => item.id === viewer.documentId)} documentId={viewer.documentId} chunkId={viewer.chunkId} onAsk={askAboutSection} onClose={closeViewer} />}
       {deleteChat && <ConfirmDeleteChat chat={deleteChat} streaming={deleteChat.messages.some((message) => message.status === "streaming")} onCancel={() => setDeleteChat(null)} onConfirm={() => { if (deleteChat.messages.some((message) => message.status === "streaming")) controller?.abort(); deleteChatWithUndo(deleteChat); setDeleteChat(null); }} />}
       {healthDocument && <DocumentHealthDialog document={healthDocument} onClose={() => setHealthDocument(null)} onSettings={() => { setHealthDocument(null); setSettingsOpen(true); }} />}
       {deleteDocument && <ConfirmDeleteDocument document={deleteDocument} onCancel={() => setDeleteDocument(null)} onConfirm={() => removeManual(deleteDocument)} />}
+      {pendingScope !== null && <ConfirmScopeChange current={activeDocument?.title || "All manuals"} next={documents.find((document) => document.id === pendingScope)?.title || "All manuals"} onCancel={() => setPendingScope(null)} onConfirm={() => applyDocument(pendingScope)} />}
       {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar" />}
       {toast && <div className="toast" role="status"><span>{toast.message}</span>{toast.action && <button onClick={toast.action.run}>{toast.action.label}</button>}<button className="toast-close" onClick={() => setToast(null)} aria-label="Dismiss notification">×</button></div>}
     </div>
@@ -507,6 +583,14 @@ function ConfirmDeleteDocument({ document, onCancel, onConfirm }: { document: Do
   </div></div>;
 }
 
+function ConfirmScopeChange({ current, next, onCancel, onConfirm }: { current: string; next: string; onCancel(): void; onConfirm(): void }) {
+  const dialogRef = useDialog<HTMLDivElement>(onCancel);
+  return <div className="modal-backdrop"><div ref={dialogRef} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="scope-change-title">
+    <h2 id="scope-change-title">Change manual scope?</h2><p>This chat currently uses {current}. Switching to {next} changes the sources used for future answers but does not change earlier responses.</p>
+    <div className="confirm-actions"><button onClick={onCancel} autoFocus>Cancel</button><button onClick={onConfirm}>Change scope</button></div>
+  </div></div>;
+}
+
 function DocumentHealthDialog({ document, onClose, onSettings }: { document: DocumentInfo; onClose(): void; onSettings(): void }) {
   const [health, setHealth] = useState<DocumentHealth | null>(null);
   const [error, setError] = useState("");
@@ -523,26 +607,30 @@ function DocumentHealthDialog({ document, onClose, onSettings }: { document: Doc
   </div></div>;
 }
 
-function SettingsDialog({ onClose, onNotify }: { onClose(): void; onNotify(message: string): void }) {
+function SettingsDialog({ onClose, onNotify, onChanged }: { onClose(): void; onNotify(message: string): void; onChanged(): void }) {
   const [value, setValue] = useState<Settings | null>(null); const [index, setIndex] = useState<EmbeddingIndexStatus | null>(null);
+  const [savedValue, setSavedValue] = useState<Settings | null>(null);
   const [status, setStatus] = useState("Loading…"); const [busy, setBusy] = useState(false);
-  const refresh = async () => { try { const [settings, indexStatus] = await Promise.all([getSettings(), embeddingIndexStatus()]); setValue(settings); setIndex(indexStatus); setStatus(""); } catch (error) { setStatus(error instanceof Error ? error.message : "Could not load settings"); } };
+  const refresh = async () => { try { const [settings, indexStatus] = await Promise.all([getSettings(), embeddingIndexStatus()]); setValue(settings); setSavedValue(settings); setIndex(indexStatus); setStatus(""); } catch (error) { setStatus(error instanceof Error ? error.message : "Could not load settings"); } };
   useEffect(() => void refresh(), []);
-  const dialogRef = useDialog<HTMLDivElement>(onClose, !busy);
+  const dirty = !!value && !!savedValue && JSON.stringify(value) !== JSON.stringify(savedValue);
+  const requestClose = () => { if (!dirty || window.confirm("Discard unsaved settings changes?")) onClose(); };
+  useEffect(() => { const warn = (event: BeforeUnloadEvent) => { if (dirty) event.preventDefault(); }; window.addEventListener("beforeunload", warn); return () => window.removeEventListener("beforeunload", warn); }, [dirty]);
+  const dialogRef = useDialog<HTMLDivElement>(requestClose, !busy);
   if (!value) return <div className="modal-backdrop"><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-label="Settings"><div className="modal-header"><h2>Settings</h2><button className="icon-button" onClick={onClose} aria-label="Close settings">×</button></div><p>{status}</p></div></div>;
   const changeProvider = (field: string, fieldValue: string) => setValue({ ...value, provider: { ...value.provider, [field]: fieldValue } });
   const changeEmbedding = (field: string, fieldValue: string | number) => setValue({ ...value, embedding: { ...value.embedding, [field]: fieldValue } });
-  const save = async () => { setBusy(true); try { setValue(await saveSettings(value)); setStatus("Settings saved"); onNotify("Settings saved"); await refresh(); } catch (error) { setStatus(error instanceof Error ? error.message : "Save failed"); } finally { setBusy(false); } };
-  const test = async (target: "provider" | "embedding") => { setBusy(true); try { const result = await testSettings(target); setStatus(`${target} connection OK: ${result.model}${result.dimensions ? ` (${result.dimensions} dimensions)` : ""}`); onNotify(`${target === "provider" ? "Chat" : "Embedding"} connection succeeded`); } catch (error) { setStatus(error instanceof Error ? error.message : "Test failed"); } finally { setBusy(false); } };
-  const build = async () => { setBusy(true); try { const result = await buildEmbeddingIndex((indexed, total) => setStatus(`Embedding ${indexed}/${total} chunks…`)); setIndex(result); setStatus("Embedding index complete"); onNotify("Embedding index complete"); } catch (error) { setStatus(error instanceof Error ? error.message : "Index build failed"); } finally { setBusy(false); } };
-	  return <div className="modal-backdrop"><div ref={dialogRef} className="modal settings-modal" role="dialog" aria-modal="true" aria-label="Provider settings"><div className="modal-header"><div><h2>Provider settings</h2><p>Saved to config.toml. Environment variables override these values. Embeddings are optional and improve search quality.</p></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="Close settings">×</button></div>
+  const save = async () => { setBusy(true); try { const saved = await saveSettings(value); setValue(saved); setSavedValue(saved); setStatus("Settings saved"); onNotify("Settings saved"); onChanged(); setIndex(await embeddingIndexStatus()); } catch (error) { setStatus(error instanceof Error ? error.message : "Save failed"); } finally { setBusy(false); } };
+  const test = async (target: "provider" | "embedding") => { setBusy(true); try { const result = await testSettings(target, value); setStatus(`${target} connection OK: ${result.model}${result.dimensions ? ` (${result.dimensions} dimensions)` : ""}`); onNotify(`${target === "provider" ? "Chat" : "Embedding"} connection succeeded`); } catch (error) { setStatus(error instanceof Error ? error.message : "Test failed"); } finally { setBusy(false); } };
+  const build = async () => { if (dirty) { setStatus("Save settings before building embeddings"); return; } setBusy(true); try { const result = await buildEmbeddingIndex((indexed, total) => setStatus(`Embedding ${indexed}/${total} chunks…`)); setIndex(result); setStatus("Embedding index complete"); onNotify("Embedding index complete"); onChanged(); } catch (error) { setStatus(error instanceof Error ? error.message : "Index build failed"); } finally { setBusy(false); } };
+	  return <div className="modal-backdrop"><div ref={dialogRef} className="modal settings-modal" role="dialog" aria-modal="true" aria-label="Provider settings"><div className="modal-header"><div><h2>Provider settings</h2><p>Saved to config.toml. Environment variables override these values. Embeddings are optional and improve search quality.</p></div><button className="icon-button" onClick={requestClose} disabled={busy} aria-label="Close settings">×</button></div>
     <div className="settings-sections">
       <fieldset><legend>Chat provider</legend><label>Base URL<input value={value.provider.base_url} onChange={(event) => changeProvider("base_url", event.target.value)} /></label><label>Model<input value={value.provider.model} onChange={(event) => changeProvider("model", event.target.value)} /></label><label>Timeout<input value={value.provider.timeout} onChange={(event) => changeProvider("timeout", event.target.value)} /></label><KeyFields settings={value.provider} change={changeProvider} /><button onClick={() => void test("provider")} disabled={busy}>Test chat connection</button></fieldset>
       <fieldset><legend>Embedding provider</legend><label>Base URL<input value={value.embedding.base_url} onChange={(event) => changeEmbedding("base_url", event.target.value)} /></label><label>Model<input value={value.embedding.model} onChange={(event) => changeEmbedding("model", event.target.value)} /></label><div className="settings-grid"><label>Dimensions<input type="number" value={value.embedding.dimensions} onChange={(event) => changeEmbedding("dimensions", Number(event.target.value))} /></label><label>Batch size<input type="number" value={value.embedding.batch_size} onChange={(event) => changeEmbedding("batch_size", Number(event.target.value))} /></label></div><label>Query instruction<textarea value={value.embedding.query_instruction} onChange={(event) => changeEmbedding("query_instruction", event.target.value)} /></label><KeyFields settings={value.embedding} change={changeEmbedding} /><button onClick={() => void test("embedding")} disabled={busy}>Test embedding connection</button></fieldset>
     </div>
     {value.environment_overrides.length > 0 && <p className="settings-warning">Environment overrides: {value.environment_overrides.join(", ")}</p>}
-    <div className="index-status"><strong>Vector index</strong><span>{index?.complete ? `${index.indexed}/${index.total} chunks indexed` : `Stale · ${index?.indexed || 0}/${index?.total || 0}`}</span><button onClick={() => void build()} disabled={busy}>Build embeddings</button></div>
-    {status && <p className="modal-status">{status}</p>}<div className="modal-footer"><span>Keys are never returned by the API.</span><button onClick={() => void save()} disabled={busy}>Save settings</button></div>
+    <div className="index-status"><strong>Vector index</strong><span>{index?.complete ? `${index.indexed}/${index.total} chunks indexed` : `Stale · ${index?.indexed || 0}/${index?.total || 0}`}</span><button onClick={() => void build()} disabled={busy || dirty} title={dirty ? "Save settings before building embeddings" : undefined}>Build embeddings</button></div>
+    {status && <p className="modal-status">{status}</p>}<div className="modal-footer"><span>{dirty ? "Unsaved changes · " : ""}Keys are never returned by the API.</span><button onClick={() => void save()} disabled={busy || !dirty}>Save settings</button></div>
   </div></div>;
 }
 

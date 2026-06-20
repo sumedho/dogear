@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getSettings, importMarkdown, loadDocumentChunks, removeDocument, searchManual, SSEParser } from "./api";
+import { getSettings, importMarkdown, loadDocumentChunks, removeDocument, searchManual, SSEParser, testSettings } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -12,6 +12,21 @@ describe("getSettings", () => {
     }), { status: 200 })));
 
     await expect(getSettings()).resolves.toMatchObject({ environment_overrides: [] });
+  });
+});
+
+describe("testSettings", () => {
+  it("sends the visible draft settings for a non-persisting connection test", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true, model: "draft" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const settings = {
+      provider: { base_url: "http://draft/v1", model: "draft", timeout: "5s", api_key_set: false },
+      embedding: { base_url: "http://embed/v1", model: "embed", timeout: "5s", api_key_set: false, dimensions: 32, batch_size: 1, query_instruction: "query" },
+      environment_overrides: [],
+    };
+    await testSettings("provider", settings);
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({ target: "provider", provider: settings.provider });
   });
 });
 
