@@ -6,6 +6,8 @@ embeddings, local reranking, and citation-grounded answers from
 OpenAI-compatible providers. It is aimed at synthesizer manuals and other
 reference documents that have already been converted to Markdown.
 
+![UI](images/)
+
 ## Requirements
 
 - Go 1.26.3 or newer.
