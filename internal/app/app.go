@@ -8,6 +8,7 @@ import (
 	"unicode"
 
 	"github.com/sumedho/dogear/internal/llm"
+	"github.com/sumedho/dogear/internal/retrievalpolicy"
 )
 
 type ProviderOverride struct {
@@ -103,7 +104,7 @@ type AskResponse struct {
 
 func Ask(ctx context.Context, retriever Retriever, opts AskOptions) (AskResult, error) {
 	if opts.Limit <= 0 {
-		opts.Limit = 8
+		opts.Limit = retrievalpolicy.DefaultContextLimit
 	}
 	retrieval, err := retriever.Retrieve(ctx, RetrieveOptions{
 		Query:      opts.Question,
@@ -161,7 +162,7 @@ func AskStream(ctx context.Context, retriever Retriever, opts AskOptions, onDelt
 		return Ask(ctx, retriever, opts)
 	}
 	if opts.Limit <= 0 {
-		opts.Limit = 8
+		opts.Limit = retrievalpolicy.DefaultContextLimit
 	}
 	retrieval, err := retriever.Retrieve(ctx, RetrieveOptions{Query: opts.Question, DocumentID: opts.DocumentID, Limit: opts.Limit})
 	if err != nil {

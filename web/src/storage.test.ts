@@ -20,6 +20,14 @@ describe("chat storage", () => {
     expect(loadChats({ getItem: () => JSON.stringify(legacy) })[0].draft).toBe("");
   });
 
+  it("marks unfinished responses as interrupted after reload", () => {
+    const chats: Chat[] = [{ id: "one", title: "MIDI", documentId: "", draft: "", messages: [
+      { id: "answer", role: "assistant", content: "Partial", status: "streaming" },
+    ], createdAt: 1, updatedAt: 2 }];
+    const loaded = loadChats({ getItem: () => JSON.stringify(chats) });
+    expect(loaded[0].messages[0]).toMatchObject({ status: "cancelled", error: expect.stringContaining("interrupted") });
+  });
+
   it("ignores malformed state", () => {
     expect(loadChats({ getItem: () => "not json" })).toEqual([]);
     expect(loadChats({ getItem: () => JSON.stringify([{ nope: true }]) })).toEqual([]);

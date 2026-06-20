@@ -109,4 +109,7 @@ export interface DocumentChunk {
 export interface ProviderSettings { base_url: string; model: string; timeout: string; api_key?: string; api_key_set: boolean; api_key_action?: string; }
 export interface EmbeddingSettings extends ProviderSettings { dimensions: number; batch_size: number; query_instruction: string; }
 export interface Settings { provider: ProviderSettings; embedding: EmbeddingSettings; environment_overrides: string[]; }
-export interface EmbeddingIndexStatus { configured: boolean; complete: boolean; stale: boolean; model: string; dimensions: number; indexed: number; total: number; updated_at?: string; }
+export interface EmbeddingIndexStatus {
+  configured: boolean; complete: boolean; stale: boolean; model: string; dimensions: number; indexed: number; total: number; updated_at?: string;
+  building?: boolean; job_id?: string; progress_indexed?: number; progress_total?: number; last_error?: string;
+}

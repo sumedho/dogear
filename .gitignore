@@ -20,6 +20,8 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 web/node_modules/
+web/test-results/
+web/playwright-report/
 *.tsbuildinfo
 
 # Go workspace file

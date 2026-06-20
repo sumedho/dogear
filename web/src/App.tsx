@@ -1,33 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { buildEmbeddingIndex, documentHealth, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, removeDocument as removeDocumentAPI, saveSettings, searchManual, streamAsk, testSettings } from "./api";
+import { documentHealth, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, removeDocument as removeDocumentAPI, searchManual, streamAsk } from "./api";
+import { SettingsDialog } from "./SettingsDialog";
+import { AnswerMarkdown, sourceDescription } from "./AnswerMarkdown";
 import { exportChats, loadChats, mergeChatBackup, newChat, saveChats } from "./storage";
-import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentHealth, DocumentInfo, EmbeddingIndexStatus, SearchResult, Settings, SourceRef } from "./types";
-
-function useDialog<T extends HTMLElement>(onClose: () => void, canClose = true) {
-  const ref = useRef<T>(null);
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    const dialog = ref.current;
-    const focusable = () => Array.from(dialog?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])') || []);
-    requestAnimationFrame(() => focusable()[0]?.focus());
-    const keydown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && canClose) { event.preventDefault(); onCloseRef.current(); return; }
-      if (event.key !== "Tab") return;
-      const items = focusable();
-      if (!items.length) return;
-      const first = items[0]; const last = items[items.length - 1];
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-    };
-    window.addEventListener("keydown", keydown);
-    return () => { window.removeEventListener("keydown", keydown); previous?.focus(); };
-  }, [canClose]);
-  return ref;
-}
+import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentHealth, DocumentInfo, SearchResult } from "./types";
+import { useDialog } from "./useDialog";
 
 type Toast = { message: string; action?: { label: string; run(): void } };
 
@@ -41,57 +20,6 @@ function chatGroup(updatedAt: number): string {
   if (age < 24 * 60 * 60 * 1000) return "Today";
   if (age < 7 * 24 * 60 * 60 * 1000) return "Previous 7 days";
   return "Older";
-}
-
-function sourceDescription(source: SourceRef): string {
-  const parts = [source.title];
-  if (source.page_number) parts.push(`p.${source.page_number}`);
-  if (source.heading_path) parts.push(source.heading_path);
-  parts.push(`lines ${source.start_line}–${source.end_line}`);
-  return parts.join(" · ");
-}
-
-type MarkdownNode = { type: string; value?: string; url?: string; children?: MarkdownNode[] };
-
-function remarkCitations() {
-  return (tree: MarkdownNode) => {
-    const visit = (node: MarkdownNode) => {
-      if (!node.children || node.type === "link") return;
-      for (let index = 0; index < node.children.length; index++) {
-        const child = node.children[index];
-        if (child.type !== "text" || !child.value) {
-          visit(child);
-          continue;
-        }
-        const parts: MarkdownNode[] = [];
-        let offset = 0;
-        for (const match of child.value.matchAll(/\[(\d+)\]/g)) {
-          if (match.index > offset) parts.push({ type: "text", value: child.value.slice(offset, match.index) });
-          parts.push({ type: "link", url: `citation:${match[1]}`, children: [{ type: "text", value: match[0] }] });
-          offset = match.index + match[0].length;
-        }
-        if (!parts.length) continue;
-        if (offset < child.value.length) parts.push({ type: "text", value: child.value.slice(offset) });
-        node.children.splice(index, 1, ...parts);
-        index += parts.length - 1;
-      }
-    };
-    visit(tree);
-  };
-}
-
-function AnswerMarkdown({ message, onOpen }: { message: ChatMessage; onOpen(documentId: string, chunkId?: number): void }) {
-  return <ReactMarkdown
-    remarkPlugins={[remarkGfm, remarkCitations]}
-    urlTransform={(url) => url.startsWith("citation:") ? url : defaultUrlTransform(url)}
-    components={{ a: ({ href, children }) => {
-      const label = href?.startsWith("citation:") ? `[${href.slice("citation:".length)}]` : "";
-      const source = message.sources?.find((candidate) => candidate.label === label);
-      if (source) return <button type="button" className="citation" title={sourceDescription(source)} onClick={() => onOpen(source.document_id, source.chunk_id)}>{children}</button>;
-      if (label) return <span className="citation citation-pending">{children}</span>;
-      return <a href={href}>{children}</a>;
-    } }}
-  >{message.content || (message.status === "streaming" ? "Searching the manual…" : "")}</ReactMarkdown>;
 }
 
 function initialChats(): Chat[] {
@@ -114,17 +42,20 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loadingDocs, setLoadingDocs] = useState(true);
   const [docsError, setDocsError] = useState("");
-  const [controller, setController] = useState<AbortController | null>(null);
+  const controllersRef = useRef(new Map<string, AbortController>());
+  const [streamingChats, setStreamingChats] = useState<Set<string>>(() => new Set());
   const [toast, setToast] = useState<Toast | null>(null);
   const [chatFilter, setChatFilter] = useState("");
   const [readiness, setReadiness] = useState<{ label: string; state: "ready" | "limited" | "needed"; detail: string }>({ label: "Checking…", state: "limited", detail: "Checking configuration" });
   const [pendingScope, setPendingScope] = useState<string | null>(null);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const messagesRef = useRef<HTMLElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const chatFilterRef = useRef<HTMLInputElement>(null);
   const chatImportRef = useRef<HTMLInputElement>(null);
   const cancelRenameRef = useRef(false);
   const current = chats.find((chat) => chat.id === activeId) || chats[0];
+  const currentController = controllersRef.current.get(current.id);
 
   const refreshDocuments = async () => {
     setLoadingDocs(true);
@@ -144,7 +75,8 @@ export default function App() {
       if (!library.length) setReadiness({ label: "Setup needed", state: "needed", detail: "Import a manual" });
       else if (!settings.provider.model.trim() && !settings.environment_overrides.includes("DOGEAR_MODEL")) setReadiness({ label: "Setup needed", state: "needed", detail: "Configure a chat model" });
       else if (!index.configured) setReadiness({ label: "FTS only", state: "limited", detail: "Embeddings are not configured" });
-      else if (index.stale || !index.complete) setReadiness({ label: "Index stale", state: "limited", detail: "Rebuild the embedding index" });
+      else if (index.building) setReadiness({ label: "Indexing", state: "limited", detail: `${index.progress_indexed || 0}/${index.progress_total || index.total} chunks` });
+      else if (index.stale || !index.complete) setReadiness({ label: "Index stale", state: "limited", detail: index.last_error || "Rebuild the embedding index" });
       else setReadiness({ label: "Hybrid ready", state: "ready", detail: `${index.indexed}/${index.total} chunks indexed` });
     } catch (error) {
       setReadiness({ label: "Setup needed", state: "needed", detail: error instanceof Error ? error.message : "Could not read configuration" });
@@ -159,7 +91,11 @@ export default function App() {
   useEffect(() => { try { saveChats(chats); } catch (error) { setToast({ message: error instanceof Error ? `Chats could not be saved: ${error.message}` : "Chats could not be saved" }); } }, [chats]);
   useEffect(() => {
     const messages = messagesRef.current;
-    if (messages) messages.scrollTo({ top: messages.scrollHeight, behavior: "smooth" });
+    if (messages) {
+      const nearBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 120;
+      if (nearBottom || !showJumpToLatest) messages.scrollTo({ top: messages.scrollHeight, behavior: "smooth" });
+      else setShowJumpToLatest(true);
+    }
     if (window.scrollY) window.scrollTo(0, 0);
   }, [current?.messages]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(null), 5000); return () => clearTimeout(timer); }, [toast]);
@@ -219,9 +155,10 @@ export default function App() {
   };
 
   const runAnswer = async (chat: Chat, question: string, history: Array<{ role: string; content: string }>, assistantId: string) => {
-    if (controller) return;
+    if (controllersRef.current.has(chat.id)) return;
     const abort = new AbortController();
-    setController(abort);
+    controllersRef.current.set(chat.id, abort);
+    setStreamingChats((items) => new Set(items).add(chat.id));
     try {
       await streamAsk(
         { question, doc: chat.documentId, limit: 8, history },
@@ -235,13 +172,14 @@ export default function App() {
       const cancelled = error instanceof DOMException && error.name === "AbortError";
       updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, status: cancelled ? "cancelled" : "error", error: cancelled ? "Stopped" : error instanceof Error ? error.message : "Request failed" } : message) }));
     } finally {
-      setController(null);
+      controllersRef.current.delete(chat.id);
+      setStreamingChats((items) => { const next = new Set(items); next.delete(chat.id); return next; });
     }
   };
 
   const send = async () => {
     const question = current.draft.trim();
-    if (!question || controller) return;
+    if (!question || currentController) return;
     const chat = current;
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: question, status: "done" };
     const assistantId = crypto.randomUUID();
@@ -260,7 +198,7 @@ export default function App() {
   };
 
   const retryAnswer = async (assistantId: string) => {
-    if (controller) return;
+    if (currentController) return;
     const assistantIndex = current.messages.findIndex((message) => message.id === assistantId);
     const userIndex = previousUserIndex(current.messages, assistantIndex);
     if (userIndex < 0) return;
@@ -302,6 +240,15 @@ export default function App() {
     const previousActiveId = activeId;
     removeChat(chat.id);
     setToast({ message: `Deleted “${chat.title}”`, action: { label: "Undo", run: () => { setChats(previousChats); setActiveId(previousActiveId); setToast(null); } } });
+  };
+
+  const copyText = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setToast({ message: `${label} copied` });
+    } catch {
+      setToast({ message: `Could not copy ${label.toLowerCase()}` });
+    }
   };
 
   const downloadChats = () => {
@@ -374,7 +321,10 @@ export default function App() {
           <button className={`readiness readiness-${readiness.state}`} title={readiness.detail} onClick={() => setSettingsOpen(true)}>{readiness.label}</button>
         </header>
 
-	        <section ref={messagesRef} className="messages">
+        <section ref={messagesRef} className="messages" onScroll={(event) => {
+          const element = event.currentTarget;
+          setShowJumpToLatest(element.scrollHeight - element.scrollTop - element.clientHeight >= 120);
+        }}>
           {!current.messages.length && (
             <div className="empty-state">
               <div className="empty-logo">D</div>
@@ -396,18 +346,20 @@ export default function App() {
                 {message.status === "streaming" && <span className="streaming-cursor" aria-label="Streaming" />}
                 {message.error && <div className={`message-error ${message.status === "cancelled" ? "muted" : ""}`}>{message.error}</div>}
                 {message.role === "assistant" && message.retrieval?.fallback_reason && <div className="retrieval-note"><span>Used full-text search: {message.retrieval.fallback_reason}.</span><button onClick={() => setSettingsOpen(true)}>{message.retrieval.fallback_reason.includes("index") ? "Rebuild index" : "Configure embeddings"}</button></div>}
-                {message.sources && message.sources.length > 0 && <SourceCards message={message} onOpen={openViewer} />}
+                {message.sources && message.sources.length > 0 && <SourceCards message={message} onOpen={openViewer} onCopy={(value) => void copyText(value, "Citation")} />}
                 {message.role === "assistant" && message.status !== "streaming" && <div className="message-actions">
-                  <button onClick={() => void navigator.clipboard.writeText(message.content)} disabled={!message.content}>Copy answer</button>
-                  <button onClick={() => void retryAnswer(message.id)} disabled={!!controller}>{message.status === "done" ? "Regenerate" : "Retry"}</button>
+                  <button onClick={() => void copyText(message.content, "Answer")} disabled={!message.content}>Copy answer</button>
+                  <button onClick={() => void retryAnswer(message.id)} disabled={!!currentController}>{message.status === "done" ? "Regenerate" : "Retry"}</button>
                   <button onClick={() => editQuestion(message.id)}>Edit question</button>
                   {message.status === "error" && <button onClick={() => setSettingsOpen(true)}>Open settings</button>}
                 </div>}
               </div>
             </article>
           ))}
-          <div className="sr-only" role="status" aria-live="polite">{controller ? "DogEar is generating a response" : ""}</div>
+          <div className="sr-only" role="status" aria-live="polite">{currentController ? "DogEar is generating a response" : ""}</div>
         </section>
+
+        {showJumpToLatest && <button className="jump-latest" onClick={() => { const element = messagesRef.current; element?.scrollTo({ top: element.scrollHeight, behavior: "smooth" }); setShowJumpToLatest(false); }}>Jump to latest ↓</button>}
 
         <div className="composer-wrap">
           <div className="composer">
@@ -426,7 +378,7 @@ export default function App() {
               title="Press / to focus · Enter to send · Shift+Enter for a new line"
               rows={1}
             />
-            {controller ? <button className="send-button stop" onClick={() => controller.abort()} aria-label="Stop response">■</button>
+            {currentController ? <button className="send-button stop" onClick={() => currentController.abort()} aria-label="Stop response">■</button>
               : <button className="send-button" onClick={() => void send()} disabled={!current.draft.trim() || !documents.length} aria-label="Send message">↑</button>}
           </div>
           <div className="composer-note">Answers are grounded in retrieved manual sections. Verify important details against the cited sources.</div>
@@ -437,7 +389,7 @@ export default function App() {
       {importOpen && <ImportDialog onClose={() => setImportOpen(false)} onImported={async () => { await refreshDocuments(); await refreshReadiness(); setToast({ message: "Manual library updated" }); }} />}
 			{settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onNotify={(message) => setToast({ message })} onChanged={() => void refreshReadiness()} />}
 		{viewer && <ManualViewer manual={documents.find((item) => item.id === viewer.documentId)} documentId={viewer.documentId} chunkId={viewer.chunkId} onAsk={askAboutSection} onClose={closeViewer} />}
-      {deleteChat && <ConfirmDeleteChat chat={deleteChat} streaming={deleteChat.messages.some((message) => message.status === "streaming")} onCancel={() => setDeleteChat(null)} onConfirm={() => { if (deleteChat.messages.some((message) => message.status === "streaming")) controller?.abort(); deleteChatWithUndo(deleteChat); setDeleteChat(null); }} />}
+      {deleteChat && <ConfirmDeleteChat chat={deleteChat} streaming={streamingChats.has(deleteChat.id)} onCancel={() => setDeleteChat(null)} onConfirm={() => { controllersRef.current.get(deleteChat.id)?.abort(); deleteChatWithUndo(deleteChat); setDeleteChat(null); }} />}
       {healthDocument && <DocumentHealthDialog document={healthDocument} onClose={() => setHealthDocument(null)} onSettings={() => { setHealthDocument(null); setSettingsOpen(true); }} />}
       {deleteDocument && <ConfirmDeleteDocument document={deleteDocument} onCancel={() => setDeleteDocument(null)} onConfirm={() => removeManual(deleteDocument)} />}
       {pendingScope !== null && <ConfirmScopeChange current={activeDocument?.title || "All manuals"} next={documents.find((document) => document.id === pendingScope)?.title || "All manuals"} onCancel={() => setPendingScope(null)} onConfirm={() => applyDocument(pendingScope)} />}
@@ -458,7 +410,7 @@ function AnswerImages({ images, onOpen }: { images: DisplayImage[]; onOpen(docum
   </div>;
 }
 
-function SourceCards({ message, onOpen }: { message: ChatMessage; onOpen(documentId: string, chunkId?: number): void }) {
+function SourceCards({ message, onOpen, onCopy }: { message: ChatMessage; onOpen(documentId: string, chunkId?: number): void; onCopy(value: string): void }) {
   const blocks = message.retrieval?.blocks || [];
   return (
     <details className="sources">
@@ -473,7 +425,7 @@ function SourceCards({ message, onOpen }: { message: ChatMessage; onOpen(documen
                 {block?.text && <p>{block.text}</p>}
                 {block?.images?.map((image) => <img key={image.id} src={`/api/images/${image.id}`} alt={image.alt} loading="lazy" />)}
               </button>
-              <button className="copy-citation" onClick={() => void navigator.clipboard.writeText(`${source.label} ${sourceDescription(source)}`)}>Copy citation</button>
+              <button className="copy-citation" onClick={() => onCopy(`${source.label} ${sourceDescription(source)}`)}>Copy citation</button>
             </div>
           );
         })}
@@ -605,37 +557,6 @@ function DocumentHealthDialog({ document, onClose, onSettings }: { document: Doc
       <section className="health-warnings"><h3>Import warnings</h3>{health.warnings.length ? <ul>{health.warnings.map((warning, index) => <li key={`${warning.code}-${warning.line || 0}-${index}`}>{warning.line ? `Line ${warning.line}: ` : ""}{warning.message}</li>)}</ul> : <p>No import warnings.</p>}</section>
       <div className="modal-footer"><button className="secondary-button" onClick={onSettings}>Open settings</button><button onClick={onClose}>Done</button></div></>}
   </div></div>;
-}
-
-function SettingsDialog({ onClose, onNotify, onChanged }: { onClose(): void; onNotify(message: string): void; onChanged(): void }) {
-  const [value, setValue] = useState<Settings | null>(null); const [index, setIndex] = useState<EmbeddingIndexStatus | null>(null);
-  const [savedValue, setSavedValue] = useState<Settings | null>(null);
-  const [status, setStatus] = useState("Loading…"); const [busy, setBusy] = useState(false);
-  const refresh = async () => { try { const [settings, indexStatus] = await Promise.all([getSettings(), embeddingIndexStatus()]); setValue(settings); setSavedValue(settings); setIndex(indexStatus); setStatus(""); } catch (error) { setStatus(error instanceof Error ? error.message : "Could not load settings"); } };
-  useEffect(() => void refresh(), []);
-  const dirty = !!value && !!savedValue && JSON.stringify(value) !== JSON.stringify(savedValue);
-  const requestClose = () => { if (!dirty || window.confirm("Discard unsaved settings changes?")) onClose(); };
-  useEffect(() => { const warn = (event: BeforeUnloadEvent) => { if (dirty) event.preventDefault(); }; window.addEventListener("beforeunload", warn); return () => window.removeEventListener("beforeunload", warn); }, [dirty]);
-  const dialogRef = useDialog<HTMLDivElement>(requestClose, !busy);
-  if (!value) return <div className="modal-backdrop"><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-label="Settings"><div className="modal-header"><h2>Settings</h2><button className="icon-button" onClick={onClose} aria-label="Close settings">×</button></div><p>{status}</p></div></div>;
-  const changeProvider = (field: string, fieldValue: string) => setValue({ ...value, provider: { ...value.provider, [field]: fieldValue } });
-  const changeEmbedding = (field: string, fieldValue: string | number) => setValue({ ...value, embedding: { ...value.embedding, [field]: fieldValue } });
-  const save = async () => { setBusy(true); try { const saved = await saveSettings(value); setValue(saved); setSavedValue(saved); setStatus("Settings saved"); onNotify("Settings saved"); onChanged(); setIndex(await embeddingIndexStatus()); } catch (error) { setStatus(error instanceof Error ? error.message : "Save failed"); } finally { setBusy(false); } };
-  const test = async (target: "provider" | "embedding") => { setBusy(true); try { const result = await testSettings(target, value); setStatus(`${target} connection OK: ${result.model}${result.dimensions ? ` (${result.dimensions} dimensions)` : ""}`); onNotify(`${target === "provider" ? "Chat" : "Embedding"} connection succeeded`); } catch (error) { setStatus(error instanceof Error ? error.message : "Test failed"); } finally { setBusy(false); } };
-  const build = async () => { if (dirty) { setStatus("Save settings before building embeddings"); return; } setBusy(true); try { const result = await buildEmbeddingIndex((indexed, total) => setStatus(`Embedding ${indexed}/${total} chunks…`)); setIndex(result); setStatus("Embedding index complete"); onNotify("Embedding index complete"); onChanged(); } catch (error) { setStatus(error instanceof Error ? error.message : "Index build failed"); } finally { setBusy(false); } };
-	  return <div className="modal-backdrop"><div ref={dialogRef} className="modal settings-modal" role="dialog" aria-modal="true" aria-label="Provider settings"><div className="modal-header"><div><h2>Provider settings</h2><p>Saved to config.toml. Environment variables override these values. Embeddings are optional and improve search quality.</p></div><button className="icon-button" onClick={requestClose} disabled={busy} aria-label="Close settings">×</button></div>
-    <div className="settings-sections">
-      <fieldset><legend>Chat provider</legend><label>Base URL<input value={value.provider.base_url} onChange={(event) => changeProvider("base_url", event.target.value)} /></label><label>Model<input value={value.provider.model} onChange={(event) => changeProvider("model", event.target.value)} /></label><label>Timeout<input value={value.provider.timeout} onChange={(event) => changeProvider("timeout", event.target.value)} /></label><KeyFields settings={value.provider} change={changeProvider} /><button onClick={() => void test("provider")} disabled={busy}>Test chat connection</button></fieldset>
-      <fieldset><legend>Embedding provider</legend><label>Base URL<input value={value.embedding.base_url} onChange={(event) => changeEmbedding("base_url", event.target.value)} /></label><label>Model<input value={value.embedding.model} onChange={(event) => changeEmbedding("model", event.target.value)} /></label><div className="settings-grid"><label>Dimensions<input type="number" value={value.embedding.dimensions} onChange={(event) => changeEmbedding("dimensions", Number(event.target.value))} /></label><label>Batch size<input type="number" value={value.embedding.batch_size} onChange={(event) => changeEmbedding("batch_size", Number(event.target.value))} /></label></div><label>Query instruction<textarea value={value.embedding.query_instruction} onChange={(event) => changeEmbedding("query_instruction", event.target.value)} /></label><KeyFields settings={value.embedding} change={changeEmbedding} /><button onClick={() => void test("embedding")} disabled={busy}>Test embedding connection</button></fieldset>
-    </div>
-    {value.environment_overrides.length > 0 && <p className="settings-warning">Environment overrides: {value.environment_overrides.join(", ")}</p>}
-    <div className="index-status"><strong>Vector index</strong><span>{index?.complete ? `${index.indexed}/${index.total} chunks indexed` : `Stale · ${index?.indexed || 0}/${index?.total || 0}`}</span><button onClick={() => void build()} disabled={busy || dirty} title={dirty ? "Save settings before building embeddings" : undefined}>Build embeddings</button></div>
-    {status && <p className="modal-status">{status}</p>}<div className="modal-footer"><span>{dirty ? "Unsaved changes · " : ""}Keys are never returned by the API.</span><button onClick={() => void save()} disabled={busy || !dirty}>Save settings</button></div>
-  </div></div>;
-}
-
-function KeyFields({ settings, change }: { settings: { api_key?: string; api_key_set: boolean; api_key_action?: string }; change(field: string, value: string): void }) {
-  return <div className="key-fields"><label>API key action<select value={settings.api_key_action || "preserve"} onChange={(event) => change("api_key_action", event.target.value)}><option value="preserve">Preserve {settings.api_key_set ? "saved key" : "empty key"}</option><option value="replace">Replace key</option><option value="clear">Clear key</option></select></label>{settings.api_key_action === "replace" && <label>New API key<input type="password" value={settings.api_key || ""} onChange={(event) => change("api_key", event.target.value)} /></label>}</div>;
 }
 
 type ImportFileStatus = { state: "ready" | "importing" | "success" | "error"; detail: string };

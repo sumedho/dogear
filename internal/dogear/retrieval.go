@@ -6,23 +6,25 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/sumedho/dogear/internal/retrievalpolicy"
 )
 
 func (s *Store) Retrieve(ctx context.Context, opts RetrieveOptions) (RetrievalResult, error) {
 	if opts.Limit <= 0 {
-		opts.Limit = 8
+		opts.Limit = retrievalpolicy.DefaultContextLimit
 	}
 	query := NormalizeFTSQuery(opts.Query)
 	if query == "" {
 		return RetrievalResult{}, errors.New("empty retrieval query")
 	}
 
-	result, err := s.retrieveWithQuery(ctx, opts, query, opts.Limit*5)
+	result, err := s.retrieveWithQuery(ctx, opts, query, opts.Limit*retrievalpolicy.CandidateMultiplier)
 	if err != nil {
 		return RetrievalResult{}, err
 	}
 	if len(result.Blocks) < opts.Limit && strings.Contains(query, " AND ") {
-		fallback, err := s.retrieveWithQuery(ctx, opts, strings.ReplaceAll(query, " AND ", " OR "), opts.Limit*5)
+		fallback, err := s.retrieveWithQuery(ctx, opts, strings.ReplaceAll(query, " AND ", " OR "), opts.Limit*retrievalpolicy.CandidateMultiplier)
 		if err != nil {
 			return RetrievalResult{}, err
 		}
@@ -80,13 +82,13 @@ type hybridRanks struct {
 
 func (s *Store) RetrieveHybrid(ctx context.Context, opts RetrieveOptions, queryVector []float32) (RetrievalResult, error) {
 	if opts.Limit <= 0 {
-		opts.Limit = 8
+		opts.Limit = retrievalpolicy.DefaultContextLimit
 	}
 	query := NormalizeFTSQuery(opts.Query)
 	if query == "" {
 		return RetrievalResult{}, errors.New("empty retrieval query")
 	}
-	fetchLimit := opts.Limit * 5
+	fetchLimit := opts.Limit * retrievalpolicy.CandidateMultiplier
 	lexical, err := s.retrieveWithQuery(ctx, opts, query, fetchLimit)
 	if err != nil {
 		return RetrievalResult{}, err
@@ -153,15 +155,14 @@ func (s *Store) RetrieveHybrid(ctx context.Context, opts RetrieveOptions, queryV
 			chunks[hit.id] = chunk
 		}
 	}
-	const rrfK = 60.0
 	candidates := make([]RetrievedChunk, 0, len(chunks))
 	for id, chunk := range chunks {
 		rank := ranks[id]
 		if rank.ftsRank > 0 {
-			rank.fused += 1 / (rrfK + float64(rank.ftsRank))
+			rank.fused += 1 / (retrievalpolicy.ReciprocalRankK + float64(rank.ftsRank))
 		}
 		if rank.vectorRank > 0 {
-			rank.fused += 1 / (rrfK + float64(rank.vectorRank))
+			rank.fused += 1 / (retrievalpolicy.ReciprocalRankK + float64(rank.vectorRank))
 		}
 		chunk.Score = -rank.fused * 100
 		candidates = append(candidates, chunk)
@@ -225,7 +226,7 @@ func (s *Store) retrieveWithQuery(ctx context.Context, opts RetrieveOptions, que
 		if err := rows.Scan(&chunk.ChunkID, &chunk.DocumentID, &chunk.Title, &chunk.Brand, &chunk.Model, &chunk.HeadingPath, &chunk.PageNumber, &chunk.StartLine, &chunk.EndLine, &chunk.Text, &chunk.Score); err != nil {
 			return RetrievalResult{}, err
 		}
-		if qualityClass(chunk.HeadingPath, chunk.Text) == QualityTOC || qualityClass(chunk.HeadingPath, chunk.Text) == QualityIndex || qualityClass(chunk.HeadingPath, chunk.Text) == QualityReferenceOnly {
+		if !isSearchableSection(chunk.HeadingPath, chunk.Text) {
 			continue
 		}
 		source := SourceRef{

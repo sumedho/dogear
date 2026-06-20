@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sumedho/dogear/internal/dogear"
@@ -46,6 +48,22 @@ func TestAPIEndpoints(t *testing.T) {
 			}
 			if contentType := response.Header().Get("Content-Type"); contentType != "application/json" {
 				t.Fatalf("content type = %q", contentType)
+			}
+		})
+	}
+}
+
+func TestDecodeJSONRejectsTrailingAndOversizedBodies(t *testing.T) {
+	for _, test := range []struct{ name, body string }{
+		{name: "trailing JSON", body: `{"value":1}{"value":2}`},
+		{name: "oversized", body: `{"value":"` + strings.Repeat("x", maxJSONBodyBytes) + `"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(test.body))
+			response := httptest.NewRecorder()
+			var destination map[string]any
+			if err := decodeJSON(response, request, &destination); err == nil {
+				t.Fatal("expected invalid JSON body to be rejected")
 			}
 		})
 	}
@@ -194,6 +212,41 @@ func TestAskDryRun(t *testing.T) {
 	if len(payload.Sources) == 0 {
 		t.Fatal("expected sources")
 	}
+}
+
+func TestAskConcurrencyLimit(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"answer"}}]}`))
+	}))
+	defer provider.Close()
+	handler := New(Options{Store: testStore(t)})
+	body := fmt.Sprintf(`{"question":"local control","base_url":%q,"model":"test-model"}`, provider.URL+"/v1")
+	var wait sync.WaitGroup
+	for range 2 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ask", strings.NewReader(body)))
+			if response.Code != http.StatusOK {
+				t.Errorf("concurrent ask status=%d body=%s", response.Code, response.Body.String())
+			}
+		}()
+	}
+	<-entered
+	<-entered
+	overloaded := httptest.NewRecorder()
+	handler.ServeHTTP(overloaded, httptest.NewRequest(http.MethodPost, "/api/ask", strings.NewReader(body)))
+	if overloaded.Code != http.StatusTooManyRequests {
+		t.Fatalf("overload status=%d body=%s", overloaded.Code, overloaded.Body.String())
+	}
+	close(release)
+	wait.Wait()
 }
 
 func TestContextDebugResponse(t *testing.T) {

@@ -83,15 +83,17 @@ func (s *Store) UpsertDocumentWithImages(ctx context.Context, doc Document, chun
 }
 
 func (s *Store) ListDocuments(ctx context.Context) ([]DocumentInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.title, d.brand, d.model, d.version, d.source_path, d.source_hash, d.tags_json, d.import_warnings_json,
+	rows, err := s.db.QueryContext(ctx, `WITH chunk_stats AS (
+			SELECT document_id, COUNT(*) AS chunk_count, COUNT(DISTINCT page_number) AS page_count FROM chunks GROUP BY document_id
+		), fts_stats AS (
+			SELECT document_id, COUNT(*) AS indexed_chunks FROM chunks_fts GROUP BY document_id
+		)
+		SELECT d.id, d.title, d.brand, d.model, d.version, d.source_path, d.source_hash, d.tags_json, d.import_warnings_json,
 			d.created_at, d.updated_at,
-			COUNT(DISTINCT c.id) AS chunk_count,
-			COUNT(DISTINCT f.rowid) AS indexed_chunks,
-			COUNT(DISTINCT c.page_number) AS page_count
+			COALESCE(c.chunk_count, 0), COALESCE(f.indexed_chunks, 0), COALESCE(c.page_count, 0)
 		FROM documents d
-		LEFT JOIN chunks c ON c.document_id = d.id
-		LEFT JOIN chunks_fts f ON f.chunk_id = c.id
-		GROUP BY d.id
+		LEFT JOIN chunk_stats c ON c.document_id = d.id
+		LEFT JOIN fts_stats f ON f.document_id = d.id
 		ORDER BY d.id`)
 	if err != nil {
 		return nil, err
@@ -101,16 +103,19 @@ func (s *Store) ListDocuments(ctx context.Context) ([]DocumentInfo, error) {
 }
 
 func (s *Store) DocumentInfo(ctx context.Context, id string) (DocumentInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.title, d.brand, d.model, d.version, d.source_path, d.source_hash, d.tags_json, d.import_warnings_json,
+	rows, err := s.db.QueryContext(ctx, `WITH chunk_stats AS (
+			SELECT document_id, COUNT(*) AS chunk_count, COUNT(DISTINCT page_number) AS page_count FROM chunks WHERE document_id = ? GROUP BY document_id
+		), fts_stats AS (
+			SELECT document_id, COUNT(*) AS indexed_chunks FROM chunks_fts WHERE document_id = ? GROUP BY document_id
+		)
+		SELECT d.id, d.title, d.brand, d.model, d.version, d.source_path, d.source_hash, d.tags_json, d.import_warnings_json,
 			d.created_at, d.updated_at,
-			COUNT(DISTINCT c.id) AS chunk_count,
-			COUNT(DISTINCT f.rowid) AS indexed_chunks,
-			COUNT(DISTINCT c.page_number) AS page_count
+			COALESCE(c.chunk_count, 0), COALESCE(f.indexed_chunks, 0), COALESCE(c.page_count, 0)
 		FROM documents d
-		LEFT JOIN chunks c ON c.document_id = d.id
-		LEFT JOIN chunks_fts f ON f.chunk_id = c.id
+		LEFT JOIN chunk_stats c ON c.document_id = d.id
+		LEFT JOIN fts_stats f ON f.document_id = d.id
 		WHERE d.id = ?
-		GROUP BY d.id`, id)
+		`, id, id, id)
 	if err != nil {
 		return DocumentInfo{}, err
 	}

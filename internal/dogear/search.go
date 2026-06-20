@@ -5,18 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/sumedho/dogear/internal/retrievalpolicy"
 )
 
 func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]SearchResult, error) {
 	if opts.Limit <= 0 {
-		opts.Limit = 10
+		opts.Limit = retrievalpolicy.DefaultSearchLimit
 	}
 	query := NormalizeFTSQuery(opts.Query)
 	if query == "" {
 		return nil, errors.New("empty search query")
 	}
 
-	fetchLimit := opts.Limit * 5
+	fetchLimit := opts.Limit * retrievalpolicy.CandidateMultiplier
 	candidates, err := s.searchWithQuery(ctx, opts, query, fetchLimit)
 	if err != nil {
 		return nil, err
@@ -112,7 +114,7 @@ func (s *Store) searchWithQuery(ctx context.Context, opts SearchOptions, query s
 		if err := rows.Scan(&result.ChunkID, &result.DocumentID, &result.Title, &result.HeadingPath, &result.PageNumber, &result.StartLine, &result.EndLine, &result.Snippet, &result.Score); err != nil {
 			return nil, err
 		}
-		if qualityClass(result.HeadingPath, result.Snippet) == QualityTOC || qualityClass(result.HeadingPath, result.Snippet) == QualityIndex || qualityClass(result.HeadingPath, result.Snippet) == QualityReferenceOnly {
+		if !isSearchableSection(result.HeadingPath, result.Snippet) {
 			continue
 		}
 		results = append(results, result)

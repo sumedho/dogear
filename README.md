@@ -309,8 +309,12 @@ Run frontend tests and produce production assets from `web/`:
 
 ```sh
 npm test
+npm run test:e2e
 npm run build
 ```
+
+The end-to-end suite runs the primary viewport checks in Chromium and WebKit.
+Install its browser runtimes once with `npx playwright install chromium webkit`.
 
 After `npm run build`, compile the Go binary again to embed the new assets.
 
@@ -327,7 +331,15 @@ DogEar keeps application behavior separate from delivery and persistence:
 - `internal/cli` defines each Cobra command in a dedicated command file and
   keeps shared JSON and text formatting separate.
 - `internal/server` exposes the JSON/SSE API and embeds the React frontend from
-  `internal/server/static`.
+  `internal/server/static`; JSON request decoding and long-running jobs have
+  dedicated helpers.
+- `internal/retrievalpolicy` centralizes retrieval limits and ranking breadth so
+  CLI, application, persistence, and HTTP defaults do not drift.
+
+The CLI uses a single SQLite connection. The server uses a small WAL-mode pool
+with per-connection foreign-key enforcement and a busy timeout. Schema upgrades
+are transactional, and embedding rebuilds run as one process-owned job that
+clients can reattach to after an SSE disconnect.
 
 ## Diagnostic Logging
 

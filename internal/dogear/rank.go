@@ -50,6 +50,11 @@ func qualityClass(heading, text string) string {
 	return QualityContent
 }
 
+func isSearchableSection(heading, text string) bool {
+	quality := qualityClass(heading, text)
+	return quality != QualityTOC && quality != QualityIndex && quality != QualityReferenceOnly
+}
+
 func rerankChunks(query string, candidates []RetrievedChunk, limit int) []RetrievedChunk {
 	if limit <= 0 {
 		limit = 8
@@ -124,9 +129,7 @@ func rankCandidate(candidate RetrievedChunk, queryTerms []string) RankDebug {
 }
 
 func shouldIndexChunk(chunk Chunk) bool {
-	return qualityClass(chunk.HeadingPath, chunk.Text) != QualityTOC &&
-		qualityClass(chunk.HeadingPath, chunk.Text) != QualityIndex &&
-		qualityClass(chunk.HeadingPath, chunk.Text) != QualityReferenceOnly
+	return isSearchableSection(chunk.HeadingPath, chunk.Text)
 }
 
 func tokenize(value string) []string {

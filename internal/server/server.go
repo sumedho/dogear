@@ -23,6 +23,7 @@ import (
 	"github.com/sumedho/dogear/internal/embedding"
 	"github.com/sumedho/dogear/internal/llm"
 	"github.com/sumedho/dogear/internal/logging"
+	"github.com/sumedho/dogear/internal/retrievalpolicy"
 	"github.com/sumedho/dogear/internal/settings"
 )
 
@@ -33,15 +34,20 @@ type Options struct {
 	Store      *dogear.Store
 	ConfigPath string
 	Logger     *slog.Logger
+	Context    context.Context
 }
 
 type Handler struct {
-	store        *dogear.Store
-	retriever    app.Retriever
-	rawRetriever dogearadapter.Retriever
-	configPath   string
-	logger       *slog.Logger
-	mux          *http.ServeMux
+	store          *dogear.Store
+	retriever      app.Retriever
+	rawRetriever   dogearadapter.Retriever
+	configPath     string
+	logger         *slog.Logger
+	mux            *http.ServeMux
+	lifecycle      context.Context
+	embeddingJob   embeddingJobManager
+	askSlots       chan struct{}
+	embeddingSlots chan struct{}
 }
 
 type askRequest struct {
@@ -79,14 +85,21 @@ func New(options Options) http.Handler {
 	if logger == nil {
 		logger = logging.Discard()
 	}
+	lifecycle := options.Context
+	if lifecycle == nil {
+		lifecycle = context.Background()
+	}
 	rawRetriever := dogearadapter.NewConfiguredRetriever(options.Store, options.ConfigPath)
 	handler := &Handler{
-		store:        options.Store,
-		retriever:    rawRetriever,
-		rawRetriever: rawRetriever,
-		configPath:   options.ConfigPath,
-		logger:       logger,
-		mux:          http.NewServeMux(),
+		store:          options.Store,
+		retriever:      rawRetriever,
+		rawRetriever:   rawRetriever,
+		configPath:     options.ConfigPath,
+		logger:         logger,
+		mux:            http.NewServeMux(),
+		lifecycle:      lifecycle,
+		askSlots:       make(chan struct{}, 2),
+		embeddingSlots: make(chan struct{}, 1),
 	}
 	handler.routes()
 	return handler
@@ -219,7 +232,7 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 	var payload settingsPayload
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&payload); err != nil {
+	if err := decodeJSON(w, r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -228,30 +241,11 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	providerTimeout, err := time.ParseDuration(payload.Provider.Timeout)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid provider timeout: %w", err))
-		return
-	}
-	embedTimeout, err := time.ParseDuration(payload.Embedding.Timeout)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid embedding timeout: %w", err))
-		return
-	}
-	current.Provider.BaseURL = strings.TrimSpace(payload.Provider.BaseURL)
-	current.Provider.Model = strings.TrimSpace(payload.Provider.Model)
-	current.Provider.Timeout = providerTimeout
-	current.Embedding.BaseURL = strings.TrimSpace(payload.Embedding.BaseURL)
-	current.Embedding.Model = strings.TrimSpace(payload.Embedding.Model)
-	current.Embedding.Timeout = embedTimeout
-	current.Embedding.Dimensions = payload.Embedding.Dimensions
-	current.Embedding.BatchSize = payload.Embedding.BatchSize
-	current.Embedding.QueryInstruction = strings.TrimSpace(payload.Embedding.QueryInstruction)
-	if err := applyKeyAction(&current.Provider.APIKey, payload.Provider.APIKeyAction, payload.Provider.APIKey); err != nil {
+	if err := applyProviderPayload(&current.Provider, payload.Provider, true); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := applyKeyAction(&current.Embedding.APIKey, payload.Embedding.APIKeyAction, payload.Embedding.APIKey); err != nil {
+	if err := applyEmbeddingPayload(&current.Embedding, payload.Embedding, true); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -295,7 +289,7 @@ func (h *Handler) testSettings(w http.ResponseWriter, r *http.Request) {
 		Provider  *settingsProviderPayload  `json:"provider,omitempty"`
 		Embedding *settingsEmbeddingPayload `json:"embedding,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -304,33 +298,17 @@ func (h *Handler) testSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if request.Target == "embedding" {
+		if !h.acquireEmbeddingSlot(w) {
+			return
+		}
+		defer h.releaseEmbeddingSlot()
 		config, err := h.resolvedEmbedding(r.Context())
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
 			return
 		}
 		if request.Embedding != nil {
-			config.BaseURL = strings.TrimSpace(request.Embedding.BaseURL)
-			config.Model = strings.TrimSpace(request.Embedding.Model)
-			config.Dimensions = request.Embedding.Dimensions
-			config.BatchSize = request.Embedding.BatchSize
-			config.QueryInstruction = strings.TrimSpace(request.Embedding.QueryInstruction)
-			if config.Dimensions < 32 || config.Dimensions > 4096 {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("embedding dimensions must be between 32 and 4096"))
-				return
-			}
-			if config.BatchSize < 1 || config.BatchSize > 256 {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("embedding batch size must be between 1 and 256"))
-				return
-			}
-			if request.Embedding.Timeout != "" {
-				config.Timeout, err = time.ParseDuration(request.Embedding.Timeout)
-				if err != nil {
-					writeError(w, http.StatusBadRequest, fmt.Errorf("invalid embedding timeout: %w", err))
-					return
-				}
-			}
-			if err := applyKeyAction(&config.APIKey, request.Embedding.APIKeyAction, request.Embedding.APIKey); err != nil {
+			if err := applyEmbeddingPayload(&config, *request.Embedding, false); err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
@@ -354,16 +332,7 @@ func (h *Handler) testSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if request.Provider != nil {
-		provider.BaseURL = strings.TrimSpace(request.Provider.BaseURL)
-		provider.Model = strings.TrimSpace(request.Provider.Model)
-		if request.Provider.Timeout != "" {
-			provider.Timeout, err = time.ParseDuration(request.Provider.Timeout)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid provider timeout: %w", err))
-				return
-			}
-		}
-		if err := applyKeyAction(&provider.APIKey, request.Provider.APIKeyAction, request.Provider.APIKey); err != nil {
+		if err := applyProviderPayload(&provider, *request.Provider, false); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -411,7 +380,25 @@ func (h *Handler) embeddingIndexStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, status)
+	type response struct {
+		dogear.EmbeddingIndexStatus
+		Building        bool   `json:"building"`
+		JobID           string `json:"job_id,omitempty"`
+		ProgressIndexed int    `json:"progress_indexed,omitempty"`
+		ProgressTotal   int    `json:"progress_total,omitempty"`
+		LastError       string `json:"last_error,omitempty"`
+	}
+	payload := response{EmbeddingIndexStatus: status}
+	if job, _, ok := h.embeddingJob.snapshot(""); ok {
+		payload.Building = !job.Done
+		payload.JobID = job.ID
+		payload.ProgressIndexed = job.Indexed
+		payload.ProgressTotal = job.Total
+		if job.Err != nil {
+			payload.LastError = job.Err.Error()
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (h *Handler) documentHealth(w http.ResponseWriter, r *http.Request) {
@@ -439,31 +426,65 @@ func (h *Handler) buildEmbeddingIndex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("streaming is not supported"))
 		return
 	}
-	config, err := h.resolvedEmbedding(r.Context())
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	client, err := embedding.NewClient(config)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
+	job, _, active := h.embeddingJob.snapshot("")
+	jobID := ""
+	if active && !job.Done {
+		jobID = job.ID
+	} else {
+		config, err := h.resolvedEmbedding(r.Context())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		client, err := embedding.NewClient(config)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		force := parseBool(r.URL.Query().Get("force"))
+		jobID = h.embeddingJob.start(h.lifecycle, func(ctx context.Context, progress func(int, int)) (dogear.EmbeddingIndexStatus, error) {
+			select {
+			case h.embeddingSlots <- struct{}{}:
+				defer h.releaseEmbeddingSlot()
+			case <-ctx.Done():
+				return dogear.EmbeddingIndexStatus{}, ctx.Err()
+			}
+			return h.store.BuildEmbeddingIndex(ctx, config.Model, config.Dimensions, config.BatchSize, config.IndexHash(), force, client.Embed, progress)
+		})
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
-	status, err := h.store.BuildEmbeddingIndex(r.Context(), config.Model, config.Dimensions, config.BatchSize, config.IndexHash(), parseBool(r.URL.Query().Get("force")), client.Embed, func(indexed, total int) {
-		_ = writeSSE(w, "progress", map[string]int{"indexed": indexed, "total": total})
-		flusher.Flush()
-	})
-	if err != nil {
-		_ = writeSSE(w, "error", errorResponse{Error: err.Error()})
-		flusher.Flush()
-		return
+	lastIndexed, lastTotal := -1, -1
+	for {
+		snapshot, changed, ok := h.embeddingJob.snapshot(jobID)
+		if !ok {
+			_ = writeSSE(w, "error", errorResponse{Error: "embedding job is unavailable"})
+			flusher.Flush()
+			return
+		}
+		if snapshot.Indexed != lastIndexed || snapshot.Total != lastTotal {
+			_ = writeSSE(w, "progress", map[string]any{"job_id": snapshot.ID, "indexed": snapshot.Indexed, "total": snapshot.Total})
+			flusher.Flush()
+			lastIndexed, lastTotal = snapshot.Indexed, snapshot.Total
+		}
+		if snapshot.Done {
+			if snapshot.Err != nil {
+				_ = writeSSE(w, "error", errorResponse{Error: snapshot.Err.Error()})
+			} else {
+				_ = writeSSE(w, "result", snapshot.Result)
+			}
+			flusher.Flush()
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-changed:
+		}
 	}
-	_ = writeSSE(w, "result", status)
-	flusher.Flush()
 }
 
 func (h *Handler) documentChunks(w http.ResponseWriter, r *http.Request) {
@@ -596,7 +617,7 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("q is required"))
 		return
 	}
-	limit, err := parseLimit(r, 10)
+	limit, err := parseLimit(r, retrievalpolicy.DefaultSearchLimit)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -621,7 +642,7 @@ func (h *Handler) context(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("q is required"))
 		return
 	}
-	limit, err := parseLimit(r, 8)
+	limit, err := parseLimit(r, retrievalpolicy.DefaultContextLimit)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -642,7 +663,7 @@ func (h *Handler) context(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 	var request askRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
 		return
 	}
@@ -651,6 +672,10 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
 		return
 	}
+	if !h.acquireAskSlot(w) {
+		return
+	}
+	defer h.releaseAskSlot()
 	result, err := app.Ask(r.Context(), h.retriever, h.askOptions(request))
 	if err != nil {
 		h.logger.ErrorContext(r.Context(), "ask failed", "stream", false, "error", err)
@@ -671,7 +696,7 @@ func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) askStream(w http.ResponseWriter, r *http.Request) {
 	var request askRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
 		return
 	}
@@ -680,6 +705,10 @@ func (h *Handler) askStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
 		return
 	}
+	if !h.acquireAskSlot(w) {
+		return
+	}
+	defer h.releaseAskSlot()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("streaming is not supported"))
@@ -710,6 +739,34 @@ func (h *Handler) askStream(w http.ResponseWriter, r *http.Request) {
 		Sources: result.Sources, Retrieval: result.Retrieval, Images: result.Images,
 	})
 	flusher.Flush()
+}
+
+func (h *Handler) acquireAskSlot(w http.ResponseWriter) bool {
+	select {
+	case h.askSlots <- struct{}{}:
+		return true
+	default:
+		writeError(w, http.StatusTooManyRequests, errors.New("too many concurrent answer requests"))
+		return false
+	}
+}
+
+func (h *Handler) releaseAskSlot() {
+	<-h.askSlots
+}
+
+func (h *Handler) acquireEmbeddingSlot(w http.ResponseWriter) bool {
+	select {
+	case h.embeddingSlots <- struct{}{}:
+		return true
+	default:
+		writeError(w, http.StatusTooManyRequests, errors.New("embedding provider is busy"))
+		return false
+	}
+}
+
+func (h *Handler) releaseEmbeddingSlot() {
+	<-h.embeddingSlots
 }
 
 func (h *Handler) askOptions(request askRequest) app.AskOptions {
@@ -774,8 +831,11 @@ func Serve(ctx context.Context, addr string, store *dogear.Store, configPath str
 		logger = logging.Discard()
 	}
 	server := &http.Server{
-		Addr:    addr,
-		Handler: New(Options{Store: store, ConfigPath: configPath, Logger: logger}),
+		Addr:              addr,
+		Handler:           New(Options{Store: store, ConfigPath: configPath, Logger: logger, Context: ctx}),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	logger.InfoContext(ctx, "server starting", "addr", addr)
 	errCh := make(chan error, 1)
@@ -784,7 +844,9 @@ func Serve(ctx context.Context, addr string, store *dogear.Store, configPath str
 	}()
 	select {
 	case <-ctx.Done():
-		if err := server.Shutdown(context.Background()); err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
 			logger.Error("server shutdown failed", "error", err)
 			return err
 		}

@@ -20,7 +20,7 @@ func newImportCommand(opts *rootOptions) *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			if err := store.Init(); err != nil {
+			if err := store.InitContext(cmd.Context()); err != nil {
 				return err
 			}
 

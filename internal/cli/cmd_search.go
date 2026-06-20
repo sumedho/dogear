@@ -5,6 +5,7 @@ import (
 	"github.com/spf13/cobra"
 	dogearadapter "github.com/sumedho/dogear/internal/adapters/dogear"
 	"github.com/sumedho/dogear/internal/dogear"
+	"github.com/sumedho/dogear/internal/retrievalpolicy"
 	"strings"
 )
 
@@ -48,7 +49,7 @@ func newSearchCommand(opts *rootOptions) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().IntVar(&limit, "limit", 10, "maximum search results")
+	cmd.Flags().IntVar(&limit, "limit", retrievalpolicy.DefaultSearchLimit, "maximum search results")
 	cmd.Flags().StringVar(&docID, "doc", "", "restrict search to one document id")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "write JSON output")
 	cmd.Flags().BoolVar(&debug, "debug", false, "include retrieval scoring debug metadata")

@@ -22,12 +22,12 @@ func newServeCommand(opts *rootOptions) *cobra.Command {
 }
 
 func runServe(cmd *cobra.Command, opts *rootOptions, addr string) error {
-	store, err := openStore(opts)
+	store, err := openServerStore(opts)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	if err := store.Init(); err != nil {
+	if err := store.InitContext(cmd.Context()); err != nil {
 		return err
 	}
 	displayAddr := addr

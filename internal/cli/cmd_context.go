@@ -5,6 +5,7 @@ import (
 	"github.com/spf13/cobra"
 	dogearadapter "github.com/sumedho/dogear/internal/adapters/dogear"
 	"github.com/sumedho/dogear/internal/dogear"
+	"github.com/sumedho/dogear/internal/retrievalpolicy"
 	"strings"
 )
 
@@ -58,7 +59,7 @@ func newContextCommand(opts *rootOptions) *cobra.Command {
 			}
 		},
 	}
-	cmd.Flags().IntVar(&limit, "limit", 8, "maximum context chunks")
+	cmd.Flags().IntVar(&limit, "limit", retrievalpolicy.DefaultContextLimit, "maximum context chunks")
 	cmd.Flags().StringVar(&docID, "doc", "", "restrict context to one document id")
 	cmd.Flags().StringVar(&format, "format", "text", "output format: text, json, or prompt")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "write JSON output")

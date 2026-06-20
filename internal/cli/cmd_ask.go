@@ -5,6 +5,7 @@ import (
 	"github.com/spf13/cobra"
 	dogearadapter "github.com/sumedho/dogear/internal/adapters/dogear"
 	"github.com/sumedho/dogear/internal/app"
+	"github.com/sumedho/dogear/internal/retrievalpolicy"
 )
 
 func newAskCommand(opts *rootOptions) *cobra.Command {
@@ -82,7 +83,7 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().IntVar(&limit, "limit", 8, "maximum context chunks")
+	cmd.Flags().IntVar(&limit, "limit", retrievalpolicy.DefaultContextLimit, "maximum context chunks")
 	cmd.Flags().StringVar(&docID, "doc", "", "restrict retrieval to one document id")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print provider request without sending it")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "write JSON output")

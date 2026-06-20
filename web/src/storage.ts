@@ -17,10 +17,20 @@ export function loadChats(storage: Pick<Storage, "getItem"> = localStorage): Cha
     const parsed = JSON.parse(value) as Chat[];
     return Array.isArray(parsed) ? parsed
 			.filter(validChat)
-      .map((chat) => ({ ...chat, draft: typeof chat.draft === "string" ? chat.draft : "" })) : [];
+      .map(normalizeChat) : [];
   } catch {
     return [];
   }
+}
+
+function normalizeChat(chat: Chat): Chat {
+  return {
+    ...chat,
+    draft: typeof chat.draft === "string" ? chat.draft : "",
+    messages: chat.messages.map((message) => message.status === "streaming"
+      ? { ...message, status: "cancelled", error: "Response interrupted when DogEar closed. Retry to continue." }
+      : message),
+  };
 }
 
 export function saveChats(chats: Chat[], storage: Pick<Storage, "setItem"> = localStorage): void {
@@ -51,7 +61,7 @@ export function mergeChatBackup(raw: string, current: Chat[]): { chats: Chat[]; 
   for (const chat of backup.chats) {
     if (ids.has(chat.id)) continue;
     ids.add(chat.id);
-    additions.push({ ...chat, draft: typeof chat.draft === "string" ? chat.draft : "" });
+    additions.push(normalizeChat(chat));
   }
   return { chats: [...additions, ...current], added: additions.length, duplicates: backup.chats.length - additions.length };
 }

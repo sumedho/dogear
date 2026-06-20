@@ -110,6 +110,10 @@ func openStore(opts *rootOptions) (*dogear.Store, error) {
 	return dogear.Open(resolveDBPath(opts.dbPath))
 }
 
+func openServerStore(opts *rootOptions) (*dogear.Store, error) {
+	return dogear.OpenWithOptions(resolveDBPath(opts.dbPath), dogear.StoreOptions{MaxOpenConns: 4})
+}
+
 func resolveDBPath(path string) string {
 	if path != "" {
 		return path

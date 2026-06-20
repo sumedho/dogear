@@ -595,38 +595,6 @@ func Slug(value string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-func NormalizeFTSQuery(query string) string {
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return ""
-	}
-	if strings.Contains(query, `"`) {
-		return query
-	}
-	var terms []string
-	for _, field := range strings.Fields(query) {
-		clean := strings.Map(func(r rune) rune {
-			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
-				return r
-			}
-			return -1
-		}, field)
-		if clean != "" && !isQueryStopword(strings.ToLower(clean)) {
-			terms = append(terms, clean)
-		}
-	}
-	return strings.Join(terms, " AND ")
-}
-
-func isQueryStopword(term string) bool {
-	switch term {
-	case "a", "an", "and", "are", "do", "does", "for", "how", "i", "in", "is", "it", "of", "on", "or", "the", "to", "what", "where":
-		return true
-	default:
-		return false
-	}
-}
-
 func hashString(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])

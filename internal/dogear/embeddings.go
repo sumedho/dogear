@@ -54,7 +54,7 @@ func (s *Store) EmbeddingChunks(ctx context.Context) ([]EmbeddingChunk, error) {
 		if err := rows.Scan(&chunk.ID, &chunk.DocumentID, &chunk.Title, &chunk.Heading, &chunk.Text, &chunk.TextHash); err != nil {
 			return nil, err
 		}
-		if qualityClass(chunk.Heading, chunk.Text) == QualityTOC || qualityClass(chunk.Heading, chunk.Text) == QualityIndex || qualityClass(chunk.Heading, chunk.Text) == QualityReferenceOnly {
+		if !isSearchableSection(chunk.Heading, chunk.Text) {
 			continue
 		}
 		chunks = append(chunks, chunk)
