@@ -47,5 +47,5 @@ export function AnswerMarkdown({ message, onOpen }: { message: ChatMessage; onOp
       if (label) return <span className="citation citation-pending">{children}</span>;
       return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
     } }}
-  >{message.content || (message.status === "streaming" ? "Searching the manual…" : "")}</ReactMarkdown>;
+  >{message.content || (message.status === "streaming" ? message.statusText || "Searching the manual…" : "")}</ReactMarkdown>;
 }

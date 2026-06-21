@@ -45,6 +45,7 @@ export interface RetrievalResult {
   mode?: "fts" | "hybrid" | string;
   fallback_reason?: string;
   blocks: ContextBlock[];
+  guide?: { title: string; sections: Array<{ heading: string; queries?: string[]; source_labels?: string[] }> };
 }
 
 export interface SearchResult {
@@ -66,7 +67,10 @@ export interface AskResult {
   sources: SourceRef[];
   retrieval: RetrievalResult;
   images?: DisplayImage[];
+  mode: "answer" | "guide";
 }
+
+export type ResponseMode = "auto" | "answer" | "guide";
 
 export interface ChatMessage {
   id: string;
@@ -77,6 +81,8 @@ export interface ChatMessage {
   sources?: SourceRef[];
   retrieval?: RetrievalResult;
   images?: DisplayImage[];
+  mode?: "answer" | "guide";
+  statusText?: string;
 }
 
 export interface Chat {

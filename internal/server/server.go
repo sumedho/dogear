@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +22,6 @@ import (
 	"github.com/sumedho/dogear/internal/embedding"
 	"github.com/sumedho/dogear/internal/llm"
 	"github.com/sumedho/dogear/internal/logging"
-	"github.com/sumedho/dogear/internal/retrievalpolicy"
 	"github.com/sumedho/dogear/internal/settings"
 )
 
@@ -60,6 +58,7 @@ type askRequest struct {
 	Model    string                    `json:"model"`
 	Timeout  string                    `json:"timeout"`
 	History  []app.ConversationMessage `json:"history"`
+	Mode     app.ResponseMode          `json:"mode,omitempty"`
 }
 
 type askResponse struct {
@@ -70,6 +69,7 @@ type askResponse struct {
 	Retrieval   app.RetrievalResult `json:"retrieval"`
 	Images      []app.DisplayImage  `json:"images,omitempty"`
 	DryRun      *llm.DryRun         `json:"dry_run,omitempty"`
+	Mode        app.ResponseMode    `json:"mode"`
 }
 
 type healthResponse struct {
@@ -484,305 +484,6 @@ func (h *Handler) buildEmbeddingIndex(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-changed:
 		}
-	}
-}
-
-func (h *Handler) documentChunks(w http.ResponseWriter, r *http.Request) {
-	after, _ := strconv.Atoi(r.URL.Query().Get("after"))
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	chunks, err := h.store.DocumentChunks(r.Context(), r.PathValue("id"), after, limit)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, documentChunkResponses(chunks))
-}
-
-func (h *Handler) documentChunk(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("chunkID"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid chunk id"))
-		return
-	}
-	chunk, err := h.store.DocumentChunk(r.Context(), r.PathValue("id"), id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, documentChunkResponseFor(chunk))
-}
-
-func (h *Handler) importMarkdown(w http.ResponseWriter, r *http.Request) {
-	const maxFileBytes = 100 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxFileBytes+(1<<20))
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid multipart upload: %w", err))
-		return
-	}
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("file is required: %w", err))
-		return
-	}
-	defer file.Close()
-	content, err := io.ReadAll(io.LimitReader(file, maxFileBytes+1))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if len(content) > maxFileBytes {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("Markdown file exceeds %d bytes", maxFileBytes))
-		return
-	}
-	meta := dogear.ImportMetadata{
-		ID: strings.TrimSpace(r.FormValue("id")), Title: strings.TrimSpace(r.FormValue("title")),
-		Brand: strings.TrimSpace(r.FormValue("brand")), Model: strings.TrimSpace(r.FormValue("model")),
-		Version: strings.TrimSpace(r.FormValue("version")),
-	}
-	if tags := strings.TrimSpace(r.FormValue("tags")); tags != "" {
-		meta.Tags = strings.Split(tags, ",")
-	}
-	result, err := dogear.ImportMarkdown(r.Context(), h.store, filepath.Base(header.Filename), content, meta, parseBool(r.FormValue("replace")))
-	if err != nil {
-		h.logger.WarnContext(r.Context(), "markdown import failed", "filename", filepath.Base(header.Filename), "error", err)
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	h.logger.InfoContext(r.Context(), "markdown imported", "filename", filepath.Base(header.Filename), "documents", result.Documents, "chunks", result.Chunks, "images", result.Images)
-	writeJSON(w, http.StatusCreated, result)
-}
-
-func (h *Handler) image(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid image id"))
-		return
-	}
-	image, err := h.store.Image(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	etag := `"` + image.ContentHash + `"`
-	w.Header().Set("ETag", etag)
-	if r.Header.Get("If-None-Match") == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	w.Header().Set("Content-Type", image.MediaType)
-	w.Header().Set("Content-Disposition", "inline")
-	w.Header().Set("Cache-Control", "private, max-age=3600")
-	w.Header().Set("Content-Length", strconv.Itoa(len(image.Data)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(image.Data)
-}
-
-func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, healthResponse{OK: true})
-}
-
-func (h *Handler) documents(w http.ResponseWriter, r *http.Request) {
-	documents, err := h.store.ListDocuments(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, documentInfoResponses(documents))
-}
-
-func (h *Handler) document(w http.ResponseWriter, r *http.Request) {
-	info, err := h.store.DocumentInfo(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, documentInfoResponseFor(info))
-}
-
-func (h *Handler) removeDocument(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.RemoveDocument(r.Context(), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	h.logger.InfoContext(r.Context(), "document removed", "document_id", r.PathValue("id"))
-	writeJSON(w, http.StatusOK, healthResponse{OK: true})
-}
-
-func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("q is required"))
-		return
-	}
-	limit, err := parseLimit(r, retrievalpolicy.DefaultSearchLimit)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	debug := parseBool(r.URL.Query().Get("debug"))
-	results, err := h.rawRetriever.SearchRaw(r.Context(), dogear.SearchOptions{
-		Query:      query,
-		DocumentID: strings.TrimSpace(r.URL.Query().Get("doc")),
-		Limit:      limit,
-		Debug:      debug,
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, searchResultResponses(results, debug))
-}
-
-func (h *Handler) context(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("q is required"))
-		return
-	}
-	limit, err := parseLimit(r, retrievalpolicy.DefaultContextLimit)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	debug := parseBool(r.URL.Query().Get("debug"))
-	result, err := h.rawRetriever.RetrieveRaw(r.Context(), dogear.RetrieveOptions{
-		Query:      query,
-		DocumentID: strings.TrimSpace(r.URL.Query().Get("doc")),
-		Limit:      limit,
-		Debug:      debug,
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, retrievalResultResponseFor(result, debug))
-}
-
-func (h *Handler) ask(w http.ResponseWriter, r *http.Request) {
-	var request askRequest
-	if err := decodeJSON(w, r, &request); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
-		return
-	}
-	request.Question = strings.TrimSpace(request.Question)
-	if request.Question == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
-		return
-	}
-	if !h.acquireAskSlot(w) {
-		return
-	}
-	defer h.releaseAskSlot()
-	result, err := app.Ask(r.Context(), h.retriever, h.askOptions(request))
-	if err != nil {
-		h.logger.ErrorContext(r.Context(), "ask failed", "stream", false, "error", err)
-		writeError(w, http.StatusBadGateway, err)
-		return
-	}
-	h.logger.InfoContext(r.Context(), "ask completed", "stream", false, "dry_run", request.DryRun, "model", result.Model, "sources", len(result.Sources))
-	writeJSON(w, http.StatusOK, askResponse{
-		Answer:      result.Answer,
-		Model:       result.Model,
-		ProviderURL: result.ProviderURL,
-		Sources:     result.Sources,
-		Retrieval:   result.Retrieval,
-		Images:      result.Images,
-		DryRun:      result.DryRun,
-	})
-}
-
-func (h *Handler) askStream(w http.ResponseWriter, r *http.Request) {
-	var request askRequest
-	if err := decodeJSON(w, r, &request); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
-		return
-	}
-	request.Question = strings.TrimSpace(request.Question)
-	if request.Question == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
-		return
-	}
-	if !h.acquireAskSlot(w) {
-		return
-	}
-	defer h.releaseAskSlot()
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("streaming is not supported"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	result, err := app.AskStream(r.Context(), h.retriever, h.askOptions(request), func(delta string) error {
-		if err := writeSSE(w, "delta", map[string]string{"content": delta}); err != nil {
-			return err
-		}
-		flusher.Flush()
-		return nil
-	})
-	if err != nil {
-		h.logger.ErrorContext(r.Context(), "ask failed", "stream", true, "error", err)
-		_ = writeSSE(w, "error", errorResponse{Error: err.Error()})
-		flusher.Flush()
-		return
-	}
-	h.logger.InfoContext(r.Context(), "ask completed", "stream", true, "model", result.Model, "sources", len(result.Sources))
-	_ = writeSSE(w, "result", askResponse{
-		Answer: result.Answer, Model: result.Model, ProviderURL: result.ProviderURL,
-		Sources: result.Sources, Retrieval: result.Retrieval, Images: result.Images,
-	})
-	flusher.Flush()
-}
-
-func (h *Handler) acquireAskSlot(w http.ResponseWriter) bool {
-	select {
-	case h.askSlots <- struct{}{}:
-		return true
-	default:
-		writeError(w, http.StatusTooManyRequests, errors.New("too many concurrent answer requests"))
-		return false
-	}
-}
-
-func (h *Handler) releaseAskSlot() {
-	<-h.askSlots
-}
-
-func (h *Handler) acquireEmbeddingSlot(w http.ResponseWriter) bool {
-	select {
-	case h.embeddingSlots <- struct{}{}:
-		return true
-	default:
-		writeError(w, http.StatusTooManyRequests, errors.New("embedding provider is busy"))
-		return false
-	}
-}
-
-func (h *Handler) releaseEmbeddingSlot() {
-	<-h.embeddingSlots
-}
-
-func (h *Handler) askOptions(request askRequest) app.AskOptions {
-	return app.AskOptions{
-		Question:   request.Question,
-		DocumentID: strings.TrimSpace(request.Document),
-		Limit:      request.Limit,
-		DryRun:     request.DryRun,
-		ConfigPath: h.configPath,
-		Provider: app.ProviderOverride{
-			BaseURL: request.BaseURL,
-			APIKey:  request.APIKey,
-			Model:   request.Model,
-			Timeout: request.Timeout,
-		},
-		History: request.History,
 	}
 }
 

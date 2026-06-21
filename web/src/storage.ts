@@ -28,7 +28,7 @@ function normalizeChat(chat: Chat): Chat {
     ...chat,
     draft: typeof chat.draft === "string" ? chat.draft : "",
     messages: chat.messages.map((message) => message.status === "streaming"
-      ? { ...message, status: "cancelled", error: "Response interrupted when DogEar closed. Retry to continue." }
+      ? { ...message, status: "cancelled", statusText: undefined, error: "Response interrupted when DogEar closed. Retry to continue." }
       : message),
   };
 }

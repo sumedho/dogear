@@ -3,12 +3,8 @@ package dogear
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -440,108 +436,6 @@ func paragraphs(lines []string, lineNumbers []int) []paragraph {
 	return result
 }
 
-func extractEmbeddedImages(lines []string) ([]string, []embeddedImage, []DocumentImportWarning, error) {
-	content := strings.Join(lines, "\n")
-	var images []embeddedImage
-	var warnings []DocumentImportWarning
-	cleaned := embeddedImageRE.ReplaceAllStringFunc(content, func(matchText string) string {
-		// Keep line breaks so section and chunk source line numbers remain stable.
-		return strings.Map(func(r rune) rune {
-			if r == '\n' || r == '\r' {
-				return r
-			}
-			return ' '
-		}, matchText)
-	})
-	for _, indexes := range anyEmbeddedImageRE.FindAllStringSubmatchIndex(content, -1) {
-		mediaType := strings.ToLower(content[indexes[4]:indexes[5]])
-		if mediaType == "image/png" || mediaType == "image/jpeg" || mediaType == "image/jpg" || mediaType == "image/gif" || mediaType == "image/webp" {
-			continue
-		}
-		line := strings.Count(content[:indexes[0]], "\n") + 1
-		warnings = append(warnings, DocumentImportWarning{Code: "unsupported_image", Message: fmt.Sprintf("An embedded %s image was skipped because its format is unsupported.", mediaType), Line: line})
-	}
-	cleaned = anyEmbeddedImageRE.ReplaceAllStringFunc(cleaned, func(matchText string) string {
-		return strings.Map(func(r rune) rune {
-			if r == '\n' || r == '\r' {
-				return r
-			}
-			return ' '
-		}, matchText)
-	})
-	for _, indexes := range embeddedImageRE.FindAllStringSubmatchIndex(content, -1) {
-		line := strings.Count(content[:indexes[0]], "\n") + 1
-		payload := strings.Map(func(r rune) rune {
-			if unicode.IsSpace(r) {
-				return -1
-			}
-			return r
-		}, content[indexes[6]:indexes[7]])
-		data, err := base64.StdEncoding.DecodeString(payload)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid embedded image on line %d: %w", line, err)
-		}
-		if len(data) > maxEmbeddedImageBytes {
-			return nil, nil, nil, fmt.Errorf("embedded image on line %d exceeds %d bytes", line, maxEmbeddedImageBytes)
-		}
-		mediaType := strings.ToLower(content[indexes[4]:indexes[5]])
-		if mediaType == "image/jpg" {
-			mediaType = "image/jpeg"
-		}
-		if detected := http.DetectContentType(data); detected != mediaType {
-			return nil, nil, nil, fmt.Errorf("embedded image on line %d declares %s but contains %s", line, mediaType, detected)
-		}
-		alt := strings.TrimSpace(content[indexes[2]:indexes[3]])
-		if alt == "" {
-			alt = "Manual image"
-			warnings = append(warnings, DocumentImportWarning{Code: "missing_image_alt", Message: "An embedded image had no alternative text; the fallback “Manual image” was used.", Line: line})
-		}
-		images = append(images, embeddedImage{line: line, alt: alt, mediaType: mediaType, data: data})
-	}
-	return strings.Split(cleaned, "\n"), images, warnings, nil
-}
-
-func attachImagesToChunks(documentID string, embedded []embeddedImage, sections []section, chunks []Chunk) ([]DocumentImage, []DocumentImportWarning) {
-	images := make([]DocumentImage, 0, len(embedded))
-	var warnings []DocumentImportWarning
-	for i, image := range embedded {
-		var sectionPath string
-		for _, sec := range sections {
-			if image.line >= sec.startLine && image.line <= sec.endLine {
-				sectionPath = sec.headingPath
-				break
-			}
-		}
-		bestOrdinal := 0
-		bestDistance := int(^uint(0) >> 1)
-		for _, chunk := range chunks {
-			if sectionPath != "" && chunk.HeadingPath != sectionPath {
-				continue
-			}
-			distance := 0
-			switch {
-			case image.line < chunk.StartLine:
-				distance = chunk.StartLine - image.line
-			case image.line > chunk.EndLine:
-				distance = image.line - chunk.EndLine
-			}
-			if distance < bestDistance {
-				bestDistance = distance
-				bestOrdinal = chunk.Ordinal
-			}
-		}
-		if bestOrdinal == 0 {
-			warnings = append(warnings, DocumentImportWarning{Code: "unattached_image", Message: "An embedded image could not be attached to searchable content.", Line: image.line})
-			continue
-		}
-		images = append(images, DocumentImage{
-			DocumentID: documentID, ChunkOrdinal: bestOrdinal, Ordinal: i + 1,
-			Alt: image.alt, MediaType: image.mediaType, Data: image.data, ContentHash: hashBytes(image.data),
-		})
-	}
-	return images, warnings
-}
-
 func skipLine(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	return strings.HasPrefix(trimmed, "![Image](data:image/")
@@ -575,59 +469,4 @@ func normalizeHeadingKey(value string) string {
 		}
 	}, value)
 	return strings.Join(strings.Fields(value), " ")
-}
-
-func Slug(value string) string {
-	value = strings.ToLower(value)
-	var b strings.Builder
-	lastDash := false
-	for _, r := range value {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-			lastDash = false
-			continue
-		}
-		if !lastDash && b.Len() > 0 {
-			b.WriteByte('-')
-			lastDash = true
-		}
-	}
-	return strings.Trim(b.String(), "-")
-}
-
-func hashString(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])
-}
-
-func hashBytes(value []byte) string {
-	hash := sha256.Sum256(value)
-	return hex.EncodeToString(hash[:])
-}
-
-func cleanTags(tags []string) []string {
-	seen := make(map[string]bool)
-	clean := make([]string, 0, len(tags))
-	for _, tag := range tags {
-		tag = strings.TrimSpace(tag)
-		if tag == "" || seen[tag] {
-			continue
-		}
-		seen[tag] = true
-		clean = append(clean, tag)
-	}
-	return clean
-}
-
-func inferBrandModel(doc *Document) {
-	if doc.Title == "" {
-		return
-	}
-	parts := strings.Fields(doc.Title)
-	if doc.Brand == "" && len(parts) > 0 {
-		doc.Brand = parts[0]
-	}
-	if doc.Model == "" && len(parts) > 1 {
-		doc.Model = strings.Join(parts[:min(len(parts), 4)], " ")
-	}
 }

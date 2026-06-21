@@ -436,6 +436,47 @@ func TestAskStreamSSE(t *testing.T) {
 	}
 }
 
+func TestGuideAskPlansThenStreamsWithStatus(t *testing.T) {
+	store := testStore(t)
+	var calls int
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", map[bool]string{true: "text/event-stream", false: "application/json"}[request.Stream])
+		if !request.Stream {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"title\":\"Local control guide\",\"sections\":[{\"heading\":\"Setup\",\"queries\":[\"local control setup\"]}]}"}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"## Setup\\nTurn it off [1].\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer provider.Close()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[provider]\nbase_url = \""+provider.URL+"/v1\"\nmodel = \"test-model\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(Options{Store: store, ConfigPath: configPath})
+	request := httptest.NewRequest(http.MethodPost, "/api/ask/stream", strings.NewReader(`{"question":"create a guide for local control","mode":"guide"}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, want := range []string{"event: status", "Planning guide", "Gathering setup sources", `"mode":"guide"`, "Turn it off [1]."} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream missing %q: %s", want, body)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("provider calls = %d, want planner and synthesis", calls)
+	}
+}
+
 func TestEmbeddedSPA(t *testing.T) {
 	handler := New(Options{Store: testStore(t)})
 	request := httptest.NewRequest(http.MethodGet, "/", nil)

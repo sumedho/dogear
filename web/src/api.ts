@@ -76,6 +76,7 @@ export async function buildEmbeddingIndex(onProgress: (indexed: number, total: n
 export interface StreamHandlers {
   onDelta(content: string): void;
   onResult(result: AskResult): void;
+  onStatus?(message: string): void;
 }
 
 export class SSEParser {
@@ -100,7 +101,7 @@ export class SSEParser {
 }
 
 export async function streamAsk(
-  request: { question: string; doc: string; limit: number; history: Array<{ role: string; content: string }> },
+  request: { question: string; doc: string; limit: number; mode?: "auto" | "answer" | "guide"; history: Array<{ role: string; content: string }> },
   handlers: StreamHandlers,
   signal: AbortSignal,
 ): Promise<void> {
@@ -122,6 +123,7 @@ export async function streamAsk(
   const emit = (event: string, data: string) => {
     const payload = JSON.parse(data) as { content?: string; error?: string } | AskResult;
     if (event === "delta") handlers.onDelta((payload as { content?: string }).content || "");
+    if (event === "status") handlers.onStatus?.((payload as { message?: string }).message || "");
     if (event === "result") {
       completed = true;
       handlers.onResult(payload as AskResult);

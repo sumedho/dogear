@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { documentHealth, embeddingIndexStatus, getSettings, importMarkdown, listDocumentChunks, listDocuments, loadDocumentChunks, removeDocument as removeDocumentAPI, searchManual, streamAsk } from "./api";
+import { useEffect, useRef, useState } from "react";
+import { embeddingIndexStatus, getSettings, listDocuments, removeDocument as removeDocumentAPI, streamAsk } from "./api";
 import { SettingsDialog } from "./SettingsDialog";
 import { AnswerMarkdown, sourceDescription } from "./AnswerMarkdown";
+import { ManualViewer } from "./ManualViewer";
+import { ImportDialog } from "./ImportDialog";
 import { exportChats, loadChats, mergeChatBackup, newChat, saveChats } from "./storage";
-import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentHealth, DocumentInfo, SearchResult } from "./types";
-import { useDialog } from "./useDialog";
+import type { AskResult, Chat, ChatMessage, DisplayImage, DocumentChunk, DocumentInfo, ResponseMode } from "./types";
+import { useChatRequests } from "./useChatRequests";
+import { ConfirmDeleteChat, ConfirmDeleteDocument, ConfirmScopeChange, DocumentHealthDialog, ManualDialog } from "./AppDialogs";
 
 type Toast = { message: string; action?: { label: string; run(): void } };
 
@@ -42,20 +43,20 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loadingDocs, setLoadingDocs] = useState(true);
   const [docsError, setDocsError] = useState("");
-  const controllersRef = useRef(new Map<string, AbortController>());
-  const [streamingChats, setStreamingChats] = useState<Set<string>>(() => new Set());
+  const requests = useChatRequests();
   const [toast, setToast] = useState<Toast | null>(null);
   const [chatFilter, setChatFilter] = useState("");
   const [readiness, setReadiness] = useState<{ label: string; state: "ready" | "limited" | "needed"; detail: string }>({ label: "Checking…", state: "limited", detail: "Checking configuration" });
   const [pendingScope, setPendingScope] = useState<string | null>(null);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [nextMode, setNextMode] = useState<ResponseMode>("auto");
   const messagesRef = useRef<HTMLElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const chatFilterRef = useRef<HTMLInputElement>(null);
   const chatImportRef = useRef<HTMLInputElement>(null);
   const cancelRenameRef = useRef(false);
   const current = chats.find((chat) => chat.id === activeId) || chats[0];
-  const currentController = controllersRef.current.get(current.id);
+  const currentController = requests.controllerFor(current.id);
 
   const refreshDocuments = async () => {
     setLoadingDocs(true);
@@ -154,17 +155,16 @@ export default function App() {
     setEditingChat(null);
   };
 
-  const runAnswer = async (chat: Chat, question: string, history: Array<{ role: string; content: string }>, assistantId: string) => {
-    if (controllersRef.current.has(chat.id)) return;
-    const abort = new AbortController();
-    controllersRef.current.set(chat.id, abort);
-    setStreamingChats((items) => new Set(items).add(chat.id));
+  const runAnswer = async (chat: Chat, question: string, history: Array<{ role: string; content: string }>, assistantId: string, mode: ResponseMode) => {
+    const abort = requests.begin(chat.id);
+    if (!abort) return;
     try {
       await streamAsk(
-        { question, doc: chat.documentId, limit: 8, history },
+        { question, doc: chat.documentId, limit: 8, mode, history },
         {
           onDelta: (content) => updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, content: message.content + content } : message), updatedAt: Date.now() })),
-          onResult: (result: AskResult) => updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, content: result.answer, status: "done", sources: result.sources, retrieval: result.retrieval, images: result.images, error: undefined } : message), updatedAt: Date.now() })),
+          onStatus: (statusText) => updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, statusText } : message) })),
+          onResult: (result: AskResult) => updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, content: result.answer, status: "done", mode: result.mode, statusText: undefined, sources: result.sources, retrieval: result.retrieval, images: result.images, error: undefined } : message), updatedAt: Date.now() })),
         },
         abort.signal,
       );
@@ -172,8 +172,7 @@ export default function App() {
       const cancelled = error instanceof DOMException && error.name === "AbortError";
       updateChat(chat.id, (value) => ({ ...value, messages: value.messages.map((message) => message.id === assistantId ? { ...message, status: cancelled ? "cancelled" : "error", error: cancelled ? "Stopped" : error instanceof Error ? error.message : "Request failed" } : message) }));
     } finally {
-      controllersRef.current.delete(chat.id);
-      setStreamingChats((items) => { const next = new Set(items); next.delete(chat.id); return next; });
+      requests.finish(chat.id, abort);
     }
   };
 
@@ -183,7 +182,8 @@ export default function App() {
     const chat = current;
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: question, status: "done" };
     const assistantId = crypto.randomUUID();
-    const assistantMessage: ChatMessage = { id: assistantId, role: "assistant", content: "", status: "streaming" };
+    const mode = nextMode;
+    const assistantMessage: ChatMessage = { id: assistantId, role: "assistant", content: "", status: "streaming", statusText: mode === "guide" ? "Planning guide…" : undefined };
     const history = chat.messages
       .filter((message) => message.content && message.status !== "error" && message.status !== "cancelled")
       .map(({ role, content }) => ({ role, content }));
@@ -194,7 +194,8 @@ export default function App() {
       messages: [...value.messages, userMessage, assistantMessage],
       updatedAt: Date.now(),
     }));
-    await runAnswer(chat, question, history, assistantId);
+    setNextMode("auto");
+    await runAnswer(chat, question, history, assistantId, mode);
   };
 
   const retryAnswer = async (assistantId: string) => {
@@ -204,8 +205,9 @@ export default function App() {
     if (userIndex < 0) return;
     const question = current.messages[userIndex].content;
     const history = current.messages.slice(0, userIndex).filter((message) => message.content && message.status !== "error" && message.status !== "cancelled").map(({ role, content }) => ({ role, content }));
-    updateChat(current.id, (chat) => ({ ...chat, messages: chat.messages.map((message) => message.id === assistantId ? { ...message, content: "", status: "streaming", error: undefined, sources: undefined, retrieval: undefined, images: undefined } : message), updatedAt: Date.now() }));
-    await runAnswer(current, question, history, assistantId);
+    const retryMode = current.messages[assistantIndex].mode === "guide" ? "guide" : "auto";
+    updateChat(current.id, (chat) => ({ ...chat, messages: chat.messages.map((message) => message.id === assistantId ? { ...message, content: "", status: "streaming", statusText: retryMode === "guide" ? "Planning guide…" : undefined, error: undefined, sources: undefined, retrieval: undefined, images: undefined } : message), updatedAt: Date.now() }));
+    await runAnswer(current, question, history, assistantId, retryMode);
   };
 
   const editQuestion = (assistantId: string) => {
@@ -338,7 +340,7 @@ export default function App() {
             <article className={`message message-${message.role}`} key={message.id}>
               <div className="avatar">{message.role === "user" ? "Y" : "D"}</div>
               <div className="message-body">
-                <div className="message-author">{message.role === "user" ? "You" : "DogEar"}</div>
+                <div className="message-author">{message.role === "user" ? "You" : "DogEar"}{message.mode === "guide" && <span className="mode-badge">Guide</span>}</div>
                 {message.role === "assistant" ? (
                   <div className="markdown"><AnswerMarkdown message={message} onOpen={openViewer} /></div>
                 ) : <div className="user-text">{message.content}</div>}
@@ -363,6 +365,7 @@ export default function App() {
 
         <div className="composer-wrap">
           <div className="composer">
+            <button className={`guide-toggle ${nextMode === "guide" ? "active" : ""}`} onClick={() => setNextMode((mode) => mode === "guide" ? "auto" : "guide")} aria-pressed={nextMode === "guide"} title="Synthesize a multi-section guide for the next message">Guide</button>
             <textarea
               ref={composerRef}
               value={current.draft}
@@ -389,7 +392,7 @@ export default function App() {
       {importOpen && <ImportDialog onClose={() => setImportOpen(false)} onImported={async () => { await refreshDocuments(); await refreshReadiness(); setToast({ message: "Manual library updated" }); }} />}
 			{settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onNotify={(message) => setToast({ message })} onChanged={() => void refreshReadiness()} />}
 		{viewer && <ManualViewer manual={documents.find((item) => item.id === viewer.documentId)} documentId={viewer.documentId} chunkId={viewer.chunkId} onAsk={askAboutSection} onClose={closeViewer} />}
-      {deleteChat && <ConfirmDeleteChat chat={deleteChat} streaming={streamingChats.has(deleteChat.id)} onCancel={() => setDeleteChat(null)} onConfirm={() => { controllersRef.current.get(deleteChat.id)?.abort(); deleteChatWithUndo(deleteChat); setDeleteChat(null); }} />}
+      {deleteChat && <ConfirmDeleteChat chat={deleteChat} streaming={requests.activeChats.has(deleteChat.id)} onCancel={() => setDeleteChat(null)} onConfirm={() => { requests.stop(deleteChat.id); deleteChatWithUndo(deleteChat); setDeleteChat(null); }} />}
       {healthDocument && <DocumentHealthDialog document={healthDocument} onClose={() => setHealthDocument(null)} onSettings={() => { setHealthDocument(null); setSettingsOpen(true); }} />}
       {deleteDocument && <ConfirmDeleteDocument document={deleteDocument} onCancel={() => setDeleteDocument(null)} onConfirm={() => removeManual(deleteDocument)} />}
       {pendingScope !== null && <ConfirmScopeChange current={activeDocument?.title || "All manuals"} next={documents.find((document) => document.id === pendingScope)?.title || "All manuals"} onCancel={() => setPendingScope(null)} onConfirm={() => applyDocument(pendingScope)} />}
@@ -432,204 +435,4 @@ function SourceCards({ message, onOpen, onCopy }: { message: ChatMessage; onOpen
       </div>
     </details>
   );
-}
-
-function ManualDialog({ documents, loading, error, onRefresh, onSelect, onOpen, onHealth, onRemove, onClose }: {
-  documents: DocumentInfo[]; loading: boolean; error: string; onRefresh(): Promise<void>; onSelect(id: string): void; onOpen(id: string): void; onHealth(document: DocumentInfo): void; onRemove(document: DocumentInfo): void; onClose(): void;
-}) {
-  const dialogRef = useDialog<HTMLDivElement>(onClose);
-  const [filter, setFilter] = useState("");
-  const normalized = filter.trim().toLowerCase();
-  const visible = documents.filter((document) => !normalized || [document.title, document.brand, document.model, document.id, ...document.tags].join(" ").toLowerCase().includes(normalized));
-  return <div className="modal-backdrop" role="presentation"><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-label="Manual library">
-	    <div className="modal-header"><div><h2>Manual library</h2><p>Select the manual used by the current chat.</p></div><button className="icon-button" onClick={onClose} aria-label="Close manual library">×</button></div>
-    <label className="library-filter"><span className="sr-only">Filter manuals</span><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter by title, brand, model, or tag" /></label>
-    {loading && <div className="modal-status">Loading manuals…</div>}
-    {error && <div className="message-error">{error} <button onClick={() => void onRefresh()}>Retry</button></div>}
-    {!loading && !error && <div className="manual-list">
-      <button className="manual-item" onClick={() => onSelect("")}><strong>All manuals</strong><span>Search every imported document</span></button>
-      {visible.map((document) => <div className="manual-item" key={document.id}>
-		<strong>{document.title}</strong><div className="manual-metadata"><span><b>ID</b> {document.id}</span>{document.brand && <span><b>Brand</b> {document.brand}</span>}{document.model && <span><b>Model</b> {document.model}</span>}{document.tags.length > 0 && <span><b>Tags</b> {document.tags.join(", ")}</span>}</div><span>{document.chunk_count} chunks · {document.page_count} pages</span>
-		<div className="manual-actions"><button onClick={() => onSelect(document.id)}>Use in chat</button><button onClick={() => onOpen(document.id)}>Open manual</button><button onClick={() => onHealth(document)}>Health</button><button className="remove-manual" onClick={() => onRemove(document)}>Remove</button></div>
-      </div>)}
-      {normalized && !visible.length && <div className="modal-status">No manuals match “{filter}”.</div>}
-    </div>}
-  </div></div>;
-}
-
-function ManualViewer({ manual, documentId, chunkId, onAsk, onClose }: { manual?: DocumentInfo; documentId: string; chunkId?: number; onAsk(chunk: DocumentChunk): void; onClose(): void }) {
-  const [chunks, setChunks] = useState<DocumentChunk[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [hasMore, setHasMore] = useState(true);
-  const [error, setError] = useState("");
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<SearchResult[]>([]);
-  const [searching, setSearching] = useState(false);
-  const [tocOpen, setTocOpen] = useState(false);
-  const loadingMoreRef = useRef(false);
-  const dialogRef = useDialog<HTMLElement>(onClose);
-  useEffect(() => {
-    let active = true; setLoading(true); setHasMore(true); setError(""); loadingMoreRef.current = false;
-    loadDocumentChunks(documentId, chunkId).then((page) => {
-      if (!active) return; setChunks(page); setLoading(false); setHasMore(page.length === 50);
-      setTimeout(() => {
-        const target = document.getElementById(`chunk-${chunkId}`);
-        const container = target?.closest("main");
-        if (target && container) container.scrollTo({ top: target.offsetTop - 20, behavior: "smooth" });
-      }, 50);
-    }).catch((reason) => { if (active) { setError(reason instanceof Error ? reason.message : "Could not load manual"); setLoading(false); } });
-    return () => { active = false; };
-  }, [documentId, chunkId]);
-  useEffect(() => {
-    const value = query.trim();
-    if (!value) { setResults([]); setSearching(false); return; }
-    let active = true; setSearching(true);
-    const timer = window.setTimeout(() => searchManual(value, documentId).then((items) => { if (active) setResults(items); }).catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Search failed"); }).finally(() => { if (active) setSearching(false); }), 250);
-    return () => { active = false; clearTimeout(timer); };
-  }, [documentId, query]);
-  const loadMore = async () => {
-    if (!hasMore || loadingMoreRef.current) return;
-    loadingMoreRef.current = true; setLoadingMore(true);
-    try {
-      const last = chunks.reduce((max, item) => Math.max(max, item.ordinal), 0);
-      const next = await listDocumentChunks(documentId, last);
-      setChunks((items) => [...items, ...next.filter((candidate) => !items.some((item) => item.id === candidate.id))]);
-      setHasMore(next.length === 50);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not load more sections");
-    } finally {
-      loadingMoreRef.current = false; setLoadingMore(false);
-    }
-  };
-  const loadNearEnd = (element: HTMLElement) => { if (element.scrollHeight - element.scrollTop - element.clientHeight < 160) void loadMore(); };
-  const openResult = (result: SearchResult) => { setTocOpen(false); location.hash = `manual/${encodeURIComponent(documentId)}/chunk/${result.chunk_id}`; };
-  return <div className="viewer-backdrop"><section ref={dialogRef} className="manual-viewer" role="dialog" aria-modal="true" aria-label={`${manual?.title || documentId} manual viewer`}>
-    <header><button className="viewer-toc-button mobile-only" onClick={() => setTocOpen((value) => !value)} aria-expanded={tocOpen}>Sections</button><div><h2>{manual?.title || documentId}</h2><span>{[manual?.id || documentId, manual?.brand, manual?.model, ...(manual?.tags || [])].filter(Boolean).join(" · ")}</span></div><button className="icon-button" onClick={onClose} aria-label="Close manual viewer">×</button></header>
-	    <div className={`viewer-layout ${tocOpen ? "toc-open" : ""}`}><nav onScroll={(event) => loadNearEnd(event.currentTarget)}><label className="viewer-search"><span className="sr-only">Search this manual</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search this manual" /></label>{query.trim() ? <div className="viewer-results">{searching && <span>Searching…</span>}{!searching && !results.length && <span>No matching sections</span>}{results.map((result) => <button key={result.chunk_id} onClick={() => openResult(result)}><strong>{result.heading_path || "Untitled section"}</strong><small>{result.page_number ? `Page ${result.page_number} · ` : ""}{result.snippet}</small></button>)}</div> : <>{chunks.map((chunk) => <a className={chunk.id === chunkId ? "active" : ""} key={chunk.id} href={`#manual/${encodeURIComponent(documentId)}/chunk/${chunk.id}`} onClick={() => setTocOpen(false)}>{chunk.heading_path || `Chunk ${chunk.ordinal}`}</a>)}{hasMore && <button className="toc-load-more" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading sections…" : "Load more sections"}</button>}</>}</nav>
-      <main onScroll={(event) => loadNearEnd(event.currentTarget)}>{loading && <p>Loading manual…</p>}{error && <div className="message-error">{error}</div>}{chunks.map((chunk) => <article id={`chunk-${chunk.id}`} className={chunk.id === chunkId ? "target-chunk" : ""} key={chunk.id}>
-        <div className="chunk-heading"><div><h3>{chunk.heading_path}</h3><div className="chunk-meta">{chunk.page_number ? `Page ${chunk.page_number} · ` : ""}lines {chunk.start_line}–{chunk.end_line}</div></div><button onClick={() => onAsk(chunk)}>Ask about this section</button></div>
-        <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{chunk.text}</ReactMarkdown></div>
-        {chunk.images?.map((image) => <img key={image.id} src={`/api/images/${image.id}`} alt={image.alt} loading="lazy" />)}
-      </article>)}{hasMore && <button className="load-more" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more"}</button>}</main>
-    </div>
-  </section></div>;
-}
-
-function ConfirmDeleteChat({ chat, streaming, onCancel, onConfirm }: { chat: Chat; streaming: boolean; onCancel(): void; onConfirm(): void }) {
-  const dialogRef = useDialog<HTMLDivElement>(onCancel);
-	  return <div className="modal-backdrop"><div ref={dialogRef} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-chat-title">
-    <h2 id="delete-chat-title">Delete chat?</h2><p>“{chat.title}” and its messages will be permanently removed.{streaming ? " The active response will be stopped." : ""}</p>
-    <div className="confirm-actions"><button onClick={onCancel} autoFocus>Cancel</button><button className="danger-button" onClick={onConfirm}>Delete</button></div>
-  </div></div>;
-}
-
-function ConfirmDeleteDocument({ document, onCancel, onConfirm }: { document: DocumentInfo; onCancel(): void; onConfirm(): Promise<void> }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const dialogRef = useDialog<HTMLDivElement>(onCancel, !busy);
-  const remove = async () => { setBusy(true); setError(""); try { await onConfirm(); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not remove manual"); setBusy(false); } };
-	  return <div className="modal-backdrop"><div ref={dialogRef} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-document-title">
-    <h2 id="delete-document-title">Remove manual?</h2><p>“{document.title}” and its indexed chunks and images will be permanently removed. Existing chats will switch to all manuals.</p>
-    {error && <div className="message-error">{error}</div>}<div className="confirm-actions"><button onClick={onCancel} disabled={busy} autoFocus>Cancel</button><button className="danger-button" onClick={() => void remove()} disabled={busy}>{busy ? "Removing…" : "Remove"}</button></div>
-  </div></div>;
-}
-
-function ConfirmScopeChange({ current, next, onCancel, onConfirm }: { current: string; next: string; onCancel(): void; onConfirm(): void }) {
-  const dialogRef = useDialog<HTMLDivElement>(onCancel);
-  return <div className="modal-backdrop"><div ref={dialogRef} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="scope-change-title">
-    <h2 id="scope-change-title">Change manual scope?</h2><p>This chat currently uses {current}. Switching to {next} changes the sources used for future answers but does not change earlier responses.</p>
-    <div className="confirm-actions"><button onClick={onCancel} autoFocus>Cancel</button><button onClick={onConfirm}>Change scope</button></div>
-  </div></div>;
-}
-
-function DocumentHealthDialog({ document, onClose, onSettings }: { document: DocumentInfo; onClose(): void; onSettings(): void }) {
-  const [health, setHealth] = useState<DocumentHealth | null>(null);
-  const [error, setError] = useState("");
-  useEffect(() => { let active = true; documentHealth(document.id).then((value) => { if (active) setHealth(value); }).catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Could not load document health"); }); return () => { active = false; }; }, [document.id]);
-  const state = (coverage: { complete: boolean; total: number }) => coverage.total === 0 ? "Empty" : coverage.complete ? "Healthy" : "Incomplete";
-  const dialogRef = useDialog<HTMLDivElement>(onClose);
-	  return <div className="modal-backdrop"><div ref={dialogRef} className="modal health-dialog" role="dialog" aria-modal="true" aria-labelledby="health-title">
-	    <div className="modal-header"><div><h2 id="health-title">Document health</h2><p>{document.title}</p></div><button className="icon-button" onClick={onClose} aria-label="Close document health">×</button></div>
-    {!health && !error && <div className="modal-status">Checking document…</div>}{error && <div className="message-error">{error}</div>}
-    {health && <><div className="health-counts"><div><strong>{health.chunk_count}</strong><span>Chunks</span></div><div><strong>{health.image_count}</strong><span>Images</span></div></div>
-      <div className="health-index"><div><strong>Full-text index</strong><span>{state(health.fts)} · {health.fts.indexed}/{health.fts.total} chunks</span></div><div><strong>Vector index</strong><span>{!health.vectors.configured ? "Not configured" : health.vectors.stale ? `Stale · ${health.vectors.indexed}/${health.vectors.total} chunks` : `${state(health.vectors)} · ${health.vectors.indexed}/${health.vectors.total} chunks`}</span></div></div>
-      <section className="health-warnings"><h3>Import warnings</h3>{health.warnings.length ? <ul>{health.warnings.map((warning, index) => <li key={`${warning.code}-${warning.line || 0}-${index}`}>{warning.line ? `Line ${warning.line}: ` : ""}{warning.message}</li>)}</ul> : <p>No import warnings.</p>}</section>
-      <div className="modal-footer"><button className="secondary-button" onClick={onSettings}>Open settings</button><button onClick={onClose}>Done</button></div></>}
-  </div></div>;
-}
-
-type ImportFileStatus = { state: "ready" | "importing" | "success" | "error"; detail: string };
-const importFileKey = (file: File) => `${file.name}-${file.size}-${file.lastModified}`;
-
-function ImportDialog({ onClose, onImported }: { onClose(): void; onImported(): Promise<void> }) {
-  const [files, setFiles] = useState<File[]>([]);
-  const [dragging, setDragging] = useState(false);
-  const [replace, setReplace] = useState(false);
-  const [metadata, setMetadata] = useState({ id: "", brand: "", model: "", tags: "" });
-  const [statuses, setStatuses] = useState<Record<string, ImportFileStatus>>({});
-  const [selectionError, setSelectionError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const totalSize = useMemo(() => files.reduce((sum, file) => sum + file.size, 0), [files]);
-  const completed = files.filter((file) => ["success", "error"].includes(statuses[importFileKey(file)]?.state)).length;
-  const failed = files.filter((file) => statuses[importFileKey(file)]?.state === "error").length;
-  const succeeded = files.filter((file) => statuses[importFileKey(file)]?.state === "success").length;
-  const dialogRef = useDialog<HTMLDivElement>(onClose, !busy);
-  const selectFiles = (selected: File[]) => {
-    const markdown = selected.filter((file) => /\.(?:md|markdown)$/i.test(file.name) || file.type === "text/markdown");
-    setFiles(markdown);
-    setStatuses(Object.fromEntries(markdown.map((file) => [importFileKey(file), { state: "ready", detail: "Ready" }])));
-    setSelectionError(markdown.length === selected.length ? "" : "Only Markdown files can be imported.");
-  };
-
-  const runImport = async () => {
-    setBusy(true);
-    const pending = files.filter((file) => statuses[importFileKey(file)]?.state !== "success");
-    for (let index = 0; index < pending.length; index++) {
-      const file = pending[index];
-      const key = importFileKey(file);
-      setStatuses((value) => ({ ...value, [key]: { state: "importing", detail: `Importing ${index + 1} of ${pending.length}…` } }));
-      try {
-        const result = await importMarkdown(file, replace, { ...metadata, id: files.length === 1 ? metadata.id.trim() : "", brand: metadata.brand.trim(), model: metadata.model.trim(), tags: metadata.tags.trim() });
-        const imageDetail = result.images === 1 ? "1 image" : `${result.images} images`;
-        const warningDetail = result.warnings?.length ? ` · ${result.warnings.length} warning${result.warnings.length === 1 ? "" : "s"}` : "";
-        setStatuses((value) => ({ ...value, [key]: { state: "success", detail: `${result.chunks} chunks · ${imageDetail}${warningDetail}` } }));
-      } catch (error) {
-        setStatuses((value) => ({ ...value, [key]: { state: "error", detail: error instanceof Error ? error.message : "Import failed" } }));
-      }
-    }
-    try {
-      await onImported();
-    } catch (error) {
-      setSelectionError(error instanceof Error ? `Files imported, but the manual list could not refresh: ${error.message}` : "Files imported, but the manual list could not refresh.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-	  return <div className="modal-backdrop" role="presentation"><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-label="Import Markdown">
-	    <div className="modal-header"><div><h2>Import Markdown</h2><p>Embedded PNG, JPEG, GIF, and WebP images are stored with their source sections.</p></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="Close import dialog">×</button></div>
-    <div className="import-metadata">
-      <label>Document ID<input value={metadata.id} disabled={busy || files.length > 1} placeholder="Generated from title when empty" onChange={(event) => setMetadata({ ...metadata, id: event.target.value })} /><small>{files.length > 1 ? "A custom ID can only be used when importing one file." : "Stable identifier used by links and replacement imports."}</small></label>
-      <label>Brand<input value={metadata.brand} disabled={busy} placeholder="e.g. Elektron" onChange={(event) => setMetadata({ ...metadata, brand: event.target.value })} /></label>
-      <label>Model<input value={metadata.model} disabled={busy} placeholder="e.g. Analog Four MKII" onChange={(event) => setMetadata({ ...metadata, model: event.target.value })} /></label>
-      <label>Tags<input value={metadata.tags} disabled={busy} placeholder="synthesizer, reference, studio" onChange={(event) => setMetadata({ ...metadata, tags: event.target.value })} /><small>Separate tags with commas.</small></label>
-    </div>
-    <label className={`file-drop${dragging ? " dragging" : ""}`}
-      onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
-      onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; setDragging(true); }}
-      onDragLeave={(event) => { event.preventDefault(); if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
-      onDrop={(event) => { event.preventDefault(); event.stopPropagation(); setDragging(false); selectFiles(Array.from(event.dataTransfer.files)); }}>
-      <input type="file" accept=".md,.markdown,text/markdown" multiple onChange={(event) => selectFiles(Array.from(event.target.files || []))} />
-      <strong>{dragging ? "Drop Markdown files here" : "Choose or drop Markdown files"}</strong><span>Up to 100 MiB per upload</span>
-    </label>
-    {selectionError && <div className="message-error">{selectionError}</div>}
-    {files.length > 0 && <><div className="import-progress"><progress max={files.length} value={completed} /><span>{busy ? `${completed} of ${files.length} complete` : completed === files.length ? `${succeeded} imported${failed ? ` · ${failed} failed` : ""}` : `${files.length} selected`}</span></div>
-      <div className="import-list">{files.map((file) => {
-        const status = statuses[importFileKey(file)] || { state: "ready", detail: "Ready" };
-        return <div className={`import-${status.state}`} key={importFileKey(file)}><span><strong>{file.name}</strong> <small>{(file.size / 1024).toFixed(1)} KiB</small></span><span className="import-detail">{status.state === "success" ? "✓ " : status.state === "error" ? "! " : ""}{status.detail}</span></div>;
-      })}</div></>}
-    <label className="checkbox"><input type="checkbox" checked={replace} onChange={(event) => setReplace(event.target.checked)} /> Replace manuals with matching IDs</label>
-    <div className="modal-footer"><span>{files.length ? `${files.length} file${files.length > 1 ? "s" : ""} · ${(totalSize / 1024 / 1024).toFixed(1)} MiB` : "No files selected"}</span><button onClick={() => void runImport()} disabled={!files.length || busy || (completed === files.length && failed === 0)}>{busy ? "Importing…" : failed ? "Retry failed" : completed === files.length ? "Imported" : "Import"}</button></div>
-  </div></div>;
 }

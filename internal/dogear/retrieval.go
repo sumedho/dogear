@@ -195,6 +195,53 @@ func (s *Store) retrievedChunk(ctx context.Context, id int64) (RetrievedChunk, e
 	return chunk, err
 }
 
+// AdjacentContext returns nearby searchable sections from the same document.
+func (s *Store) AdjacentContext(ctx context.Context, chunkID int64, limit int) ([]ContextBlock, error) {
+	if limit <= 0 || limit > 4 {
+		limit = 1
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT nearby.id FROM chunks target
+		JOIN chunks nearby ON nearby.document_id = target.document_id AND nearby.id <> target.id
+		WHERE target.id = ? ORDER BY ABS(nearby.ordinal - target.ordinal), nearby.ordinal LIMIT ?`, chunkID, limit*4)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	blocks := make([]ContextBlock, 0, limit)
+	for _, id := range ids {
+		chunk, err := s.retrievedChunk(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if !isSearchableSection(chunk.HeadingPath, chunk.Text) {
+			continue
+		}
+		images, err := s.imagesForChunk(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, ContextBlock{Source: SourceRef{ChunkID: chunk.ChunkID, DocumentID: chunk.DocumentID, Title: chunk.Title, Brand: chunk.Brand, Model: chunk.Model, HeadingPath: chunk.HeadingPath, PageNumber: chunk.PageNumber, StartLine: chunk.StartLine, EndLine: chunk.EndLine, Score: chunk.Score}, Text: chunk.Text, Images: images})
+		if len(blocks) == limit {
+			break
+		}
+	}
+	return blocks, nil
+}
+
 func (s *Store) retrieveWithQuery(ctx context.Context, opts RetrieveOptions, query string, fetchLimit int) (RetrievalResult, error) {
 	if fetchLimit <= 0 {
 		fetchLimit = opts.Limit

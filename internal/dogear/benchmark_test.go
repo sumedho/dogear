@@ -63,3 +63,31 @@ func BenchmarkParseMarkdown(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkRebuildFTSLargeLibrary(b *testing.B) {
+	store := benchmarkStore(b)
+	b.ResetTimer()
+	for range b.N {
+		if _, err := store.RebuildIndex(context.Background()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkBuildEmbeddingsLargeLibrary(b *testing.B) {
+	store := benchmarkStore(b)
+	embed := func(_ context.Context, inputs []string) ([][]float32, error) {
+		vectors := make([][]float32, len(inputs))
+		for index := range vectors {
+			vectors[index] = make([]float32, 32)
+		}
+		return vectors, nil
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := store.BuildEmbeddingIndex(context.Background(), "benchmark", 32, 32, "benchmark", true, embed, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

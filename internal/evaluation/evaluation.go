@@ -24,6 +24,9 @@ type Case struct {
 	DocumentID     string     `json:"document_id"`
 	Relevant       []Relevant `json:"relevant"`
 	AnswerContains []string   `json:"answer_contains"`
+	ExpectedSections      []string `json:"expected_sections,omitempty"`
+	RequireOrderedSteps   bool     `json:"require_ordered_steps,omitempty"`
+	RequireConflictNotice bool     `json:"require_conflict_notice,omitempty"`
 }
 type Relevant struct {
 	HeadingPath  string `json:"heading_path"`
@@ -40,6 +43,9 @@ type CaseReport struct {
 	CitationPrecision float64 `json:"citation_precision,omitempty"`
 	CitationRecall    float64 `json:"citation_recall,omitempty"`
 	Error             string  `json:"error,omitempty"`
+	GuideSectionRecall float64 `json:"guide_section_recall,omitempty"`
+	OrderedSteps       bool    `json:"ordered_steps,omitempty"`
+	ConflictNotice     bool    `json:"conflict_notice,omitempty"`
 }
 type Report struct {
 	Mode             string          `json:"mode"`
@@ -133,6 +139,7 @@ func Run(ctx context.Context, fixture Fixture, mode string, ks []int, retrieve R
 					caseReport.AnswerTermRecall /= float64(len(item.AnswerContains))
 				}
 				caseReport.CitationValidity, caseReport.CitationPrecision, caseReport.CitationRecall = citationMetrics(text, len(result.Blocks), caseReport.RelevantRanks)
+				caseReport.GuideSectionRecall, caseReport.OrderedSteps, caseReport.ConflictNotice = guideMetrics(text, item)
 			}
 		}
 		report.Results = append(report.Results, caseReport)
@@ -163,6 +170,7 @@ func matchesAny(block dogear.ContextBlock, selectors []Relevant) bool {
 }
 
 var citationRE = regexp.MustCompile(`\[([0-9]+)\]`)
+var orderedStepRE = regexp.MustCompile(`(?m)^\s*[0-9]+[.)]\s+`)
 
 func citationMetrics(answer string, sourceCount int, relevantRanks []int) (float64, float64, float64) {
 	matches := citationRE.FindAllStringSubmatch(answer, -1)
@@ -196,4 +204,16 @@ func citationMetrics(answer string, sourceCount int, relevantRanks []int) (float
 		recall = float64(len(citedRelevant)) / float64(len(relevant))
 	}
 	return float64(valid) / float64(len(matches)), precision, recall
+}
+
+func guideMetrics(answer string, item Case) (float64, bool, bool) {
+	lower := strings.ToLower(answer)
+	sectionRecall := 0.0
+	for _, section := range item.ExpectedSections {
+		if strings.Contains(lower, strings.ToLower(section)) { sectionRecall++ }
+	}
+	if len(item.ExpectedSections) > 0 { sectionRecall /= float64(len(item.ExpectedSections)) }
+	ordered := !item.RequireOrderedSteps || orderedStepRE.MatchString(answer)
+	conflict := !item.RequireConflictNotice || strings.Contains(lower, "conflict") || strings.Contains(lower, "differs") || strings.Contains(lower, "disagree")
+	return sectionRecall, ordered, conflict
 }

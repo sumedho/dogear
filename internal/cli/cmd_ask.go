@@ -17,6 +17,7 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 	var apiKey string
 	var model string
 	var timeoutValue string
+	var guide bool
 
 	cmd := &cobra.Command{
 		Use:   "ask QUESTION",
@@ -41,6 +42,12 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 					Model:   model,
 					Timeout: timeoutValue,
 				},
+			}
+			if guide {
+				askOptions.Mode = app.ResponseModeGuide
+			}
+			if !dryRun && !jsonOut {
+				askOptions.OnStatus = func(status string) error { _, err := fmt.Fprintln(opts.errOut, status); return err }
 			}
 			retriever := dogearadapter.NewConfiguredRetriever(store, resolveConfigPath(opts.configPath))
 			if !dryRun && !jsonOut {
@@ -77,6 +84,7 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 					Sources:     result.Sources,
 					Retrieval:   result.Retrieval,
 					Images:      result.Images,
+					Mode:        result.Mode,
 				})
 			}
 
@@ -91,5 +99,6 @@ func newAskCommand(opts *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&apiKey, "api-key", "", "provider API key; optional for local endpoints")
 	cmd.Flags().StringVar(&model, "model", "", "provider model name")
 	cmd.Flags().StringVar(&timeoutValue, "timeout", "", "provider request timeout, such as 30s")
+	cmd.Flags().BoolVar(&guide, "guide", false, "synthesize a multi-section guide from multiple retrieval queries")
 	return cmd
 }

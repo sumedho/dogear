@@ -41,6 +41,7 @@ type RetrievalStore interface {
 	RetrieveHybrid(context.Context, RetrieveOptions, []float32) (RetrievalResult, error)
 	Search(context.Context, SearchOptions) ([]SearchResult, error)
 	SearchHybrid(context.Context, SearchOptions, []float32) ([]SearchResult, error)
+	AdjacentContext(context.Context, int64, int) ([]ContextBlock, error)
 }
 
 // EmbeddingStore manages vector index contents and lifecycle.

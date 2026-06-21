@@ -26,7 +26,17 @@ type AskOptions struct {
 	ConfigPath string
 	Provider   ProviderOverride
 	History    []ConversationMessage
+	Mode       ResponseMode
+	OnStatus   func(string) error
 }
+
+type ResponseMode string
+
+const (
+	ResponseModeAuto   ResponseMode = "auto"
+	ResponseModeAnswer ResponseMode = "answer"
+	ResponseModeGuide  ResponseMode = "guide"
+)
 
 type ConversationMessage struct {
 	Role    string `json:"role"`
@@ -51,6 +61,7 @@ type AskResult struct {
 	Retrieval   RetrievalResult
 	Images      []DisplayImage `json:"images,omitempty"`
 	DryRun      *llm.DryRun
+	Mode        ResponseMode
 }
 
 type SourceRef struct {
@@ -91,6 +102,18 @@ type RetrievalResult struct {
 	Mode           string         `json:"mode,omitempty"`
 	FallbackReason string         `json:"fallback_reason,omitempty"`
 	Blocks         []ContextBlock `json:"blocks"`
+	Guide          *GuideContext  `json:"guide,omitempty"`
+}
+
+type GuideContext struct {
+	Title    string         `json:"title"`
+	Sections []GuideSection `json:"sections"`
+}
+
+type GuideSection struct {
+	Heading      string   `json:"heading"`
+	Queries      []string `json:"queries,omitempty"`
+	SourceLabels []string `json:"source_labels,omitempty"`
 }
 
 type AskResponse struct {
@@ -100,9 +123,13 @@ type AskResponse struct {
 	Sources     []SourceRef     `json:"sources"`
 	Retrieval   RetrievalResult `json:"retrieval"`
 	Images      []DisplayImage  `json:"images,omitempty"`
+	Mode        ResponseMode    `json:"mode"`
 }
 
 func Ask(ctx context.Context, retriever Retriever, opts AskOptions) (AskResult, error) {
+	if resolveResponseMode(opts.Mode, opts.Question) == ResponseModeGuide {
+		return askGuide(ctx, retriever, opts, nil)
+	}
 	if opts.Limit <= 0 {
 		opts.Limit = retrievalpolicy.DefaultContextLimit
 	}
@@ -143,6 +170,7 @@ func Ask(ctx context.Context, retriever Retriever, opts AskOptions) (AskResult, 
 		Sources:     sourceRefs(retrieval),
 		Retrieval:   retrieval,
 		Images:      displayImages(opts.Question, retrieval),
+		Mode:        ResponseModeAnswer,
 	}
 	if opts.DryRun {
 		dryRun := client.DryRun(request)
@@ -160,6 +188,9 @@ func Ask(ctx context.Context, retriever Retriever, opts AskOptions) (AskResult, 
 func AskStream(ctx context.Context, retriever Retriever, opts AskOptions, onDelta func(string) error) (AskResult, error) {
 	if opts.DryRun {
 		return Ask(ctx, retriever, opts)
+	}
+	if resolveResponseMode(opts.Mode, opts.Question) == ResponseModeGuide {
+		return askGuide(ctx, retriever, opts, onDelta)
 	}
 	if opts.Limit <= 0 {
 		opts.Limit = retrievalpolicy.DefaultContextLimit
@@ -186,7 +217,7 @@ func AskStream(ctx context.Context, retriever Retriever, opts AskOptions, onDelt
 	}
 	return AskResult{
 		Answer: response.Content, Model: config.Model, ProviderURL: client.DryRun(request).URL,
-		Sources: sourceRefs(retrieval), Retrieval: retrieval, Images: displayImages(opts.Question, retrieval),
+		Sources: sourceRefs(retrieval), Retrieval: retrieval, Images: displayImages(opts.Question, retrieval), Mode: ResponseModeAnswer,
 	}, nil
 }
 

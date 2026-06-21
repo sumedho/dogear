@@ -35,6 +35,14 @@ func (r Retriever) Retrieve(ctx context.Context, opts app.RetrieveOptions) (app.
 	return retrievalResult(result), nil
 }
 
+func (r Retriever) Adjacent(ctx context.Context, source app.SourceRef, limit int) ([]app.ContextBlock, error) {
+	blocks, err := r.store.AdjacentContext(ctx, source.ChunkID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return retrievalResult(dogear.RetrievalResult{Blocks: blocks}).Blocks, nil
+}
+
 func (r Retriever) retrieve(ctx context.Context, opts dogear.RetrieveOptions) (dogear.RetrievalResult, error) {
 	if r.configPath == "" {
 		return r.store.Retrieve(ctx, opts)

@@ -110,3 +110,33 @@ func TestInitContextHonorsCancellation(t *testing.T) {
 		t.Fatal("expected initialization to stop for a cancelled context")
 	}
 }
+
+func TestAdjacentContextReturnsNearestSearchableSection(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "adjacent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.InitContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	chunks := []Chunk{
+		{Ordinal: 1, HeadingPath: "Prerequisites", Text: "Connect the controller before configuration begins.", TextHash: "one"},
+		{Ordinal: 2, HeadingPath: "Setup", Text: "Set local control to off when using a sequencer.", TextHash: "two"},
+		{Ordinal: 3, HeadingPath: "Verification", Text: "Play a note and confirm that only one voice sounds.", TextHash: "three"},
+	}
+	if err := store.UpsertDocument(context.Background(), Document{ID: "manual", Title: "Manual", SourcePath: "manual.md", SourceHash: "hash"}, chunks, false); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.DocumentChunks(context.Background(), "manual", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adjacent, err := store.AdjacentContext(context.Background(), stored[1].ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adjacent) != 1 || adjacent[0].Source.ChunkID != stored[0].ID {
+		t.Fatalf("adjacent = %#v", adjacent)
+	}
+}

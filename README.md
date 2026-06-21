@@ -239,6 +239,18 @@ Use `--dry-run` to print the provider URL, redacted headers, and JSON body witho
 
 `ask` prints the answer followed by all retrieved sources. Use `--json` for structured output.
 
+Guide-style questions such as “How do I set this up?” automatically use
+multi-query guide synthesis. Use `--guide` to force a planned guide with
+prerequisites, ordered steps, verification, troubleshooting, and citations:
+
+```sh
+./dogear ask --guide "Configure MIDI clock with an external sequencer"
+```
+
+Guide responses make one planning request followed by the answer request and
+may take longer than focused answers. The web composer provides a one-shot
+Guide control for the next message.
+
 ## Local Web UI and JSON API
 
 Serve the embedded React chat UI from the same database and config used by the CLI:
@@ -291,8 +303,11 @@ The streaming endpoint uses server-sent events:
 ```sh
 curl -N -X POST http://127.0.0.1:8765/api/ask/stream \
   -H 'Content-Type: application/json' \
-  -d '{"question":"How do I turn off local control?","history":[]}'
+  -d '{"question":"How do I turn off local control?","mode":"guide","history":[]}'
 ```
+
+Ask mode may be `auto` (the default), `answer`, or `guide`. Streaming guide
+requests emit `status` events while planning and gathering section evidence.
 
 The production UI is always served from assets embedded in the Go binary.
 Generated files under `internal/server/static/` should be committed with
@@ -304,6 +319,7 @@ Run the complete Go checks from the repository root:
 
 ```sh
 go test ./...
+go test -race ./...
 go vet ./...
 ```
 
@@ -317,6 +333,8 @@ npm run build
 
 The end-to-end suite runs the primary viewport checks in Chromium and WebKit.
 Install its browser runtimes once with `npx playwright install chromium webkit`.
+GitHub Actions runs the same Go, frontend, embedded-asset, and browser checks on
+pushes and pull requests.
 
 After `npm run build`, compile the Go binary again to embed the new assets.
 
@@ -333,8 +351,8 @@ DogEar keeps application behavior separate from delivery and persistence:
 - `internal/cli` defines each Cobra command in a dedicated command file and
   keeps shared JSON and text formatting separate.
 - `internal/server` exposes the JSON/SSE API and embeds the React frontend from
-  `internal/server/static`; JSON request decoding and long-running jobs have
-  dedicated helpers.
+  `internal/server/static`; answer, document/import, JSON request, and
+  long-running job concerns have dedicated files.
 - `internal/retrievalpolicy` centralizes retrieval limits and ranking breadth so
   CLI, application, persistence, and HTTP defaults do not drift.
 

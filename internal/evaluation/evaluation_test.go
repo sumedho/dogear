@@ -18,3 +18,12 @@ func TestRunMetrics(t *testing.T) {
 		t.Fatalf("unexpected report: %#v", report)
 	}
 }
+
+func TestGuideAnswerMetrics(t *testing.T) {
+	fixture := Fixture{Cases: []Case{{ID: "guide", Query: "setup", Relevant: []Relevant{{HeadingPath: "Setup"}}, ExpectedSections: []string{"Prerequisites", "Verification", "Troubleshooting"}, RequireOrderedSteps: true, RequireConflictNotice: true}}}
+	retrieve := func(context.Context, string, Case, int) (dogear.RetrievalResult, error) { return dogear.RetrievalResult{Blocks: []dogear.ContextBlock{{Source: dogear.SourceRef{HeadingPath: "Setup"}}}}, nil }
+	answer := func(context.Context, string, Case) (string, error) { return "## Prerequisites\nReady.\n\n1. Configure it [1].\n\n## Verification\nTest it.\n\n## Troubleshooting\nThe manuals conflict on this setting.", nil }
+	report := Run(context.Background(), fixture, "guide", []int{1}, retrieve, answer)
+	result := report.Results[0]
+	if result.GuideSectionRecall != 1 || !result.OrderedSteps || !result.ConflictNotice || result.CitationValidity != 1 { t.Fatalf("guide metrics = %#v", result) }
+}

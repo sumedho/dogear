@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getSettings, importMarkdown, loadDocumentChunks, removeDocument, searchManual, SSEParser, testSettings } from "./api";
+import { getSettings, importMarkdown, loadDocumentChunks, removeDocument, searchManual, SSEParser, streamAsk, testSettings } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -98,5 +98,19 @@ describe("SSEParser", () => {
     const events: string[] = [];
     parser.push("event: message\ndata: first\ndata: second\n\n", (_event, data) => events.push(data));
     expect(events).toEqual(["first\nsecond"]);
+  });
+});
+
+describe("streamAsk", () => {
+  it("sends guide mode and emits planning status", async () => {
+    const body = 'event: status\ndata: {"message":"Planning guide…"}\n\nevent: result\ndata: {"answer":"Guide","mode":"guide","model":"test","provider_url":"local","sources":[],"retrieval":{"query":"setup","blocks":[]}}\n\n';
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const statuses: string[] = [];
+    let mode = "";
+    await streamAsk({ question: "setup", doc: "manual", limit: 8, mode: "guide", history: [] }, { onDelta: () => {}, onStatus: (status) => statuses.push(status), onResult: (result) => { mode = result.mode; } }, new AbortController().signal);
+    expect(statuses).toEqual(["Planning guide…"]);
+    expect(mode).toBe("guide");
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toMatchObject({ mode: "guide" });
   });
 });
